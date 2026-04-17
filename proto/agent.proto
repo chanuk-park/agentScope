@@ -1,0 +1,22 @@
+syntax = "proto3";
+package agent;
+option go_package = "agentscope/gen/agent";
+
+service AgentMonitor {
+    rpc StreamEvents(stream AgentEvent) returns (Ack);
+}
+
+message AgentEvent {
+    string host         = 1;
+    uint32 pid          = 2;
+    double timestamp    = 3;
+    string direction    = 4;  // "send" | "recv"
+    string comm_type    = 5;  // Agent↔Model | Agent↔Agent | Agent↔MCP
+    string content_type = 6;  // TEXT | FILE_READ | FILE | IMAGE
+    string peer         = 7;
+    string request      = 8;  // JSON string
+    string response     = 9;  // JSON string
+    double latency_ms   = 10;
+}
+
+message Ack {}
