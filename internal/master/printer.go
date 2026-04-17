@@ -9,6 +9,8 @@ import (
 
 const (
 	reset  = "\033[0m"
+	bold   = "\033[1m"
+	red    = "\033[31m"
 	blue   = "\033[34m"
 	yellow = "\033[33m"
 	green  = "\033[32m"
@@ -41,32 +43,102 @@ func (p *printer) print(e *Event) {
 		"Agent↔MCP":   green + "Agent↔MCP  " + reset,
 	}[e.CommType]
 
-	dir := gray + "→ send" + reset
-	if e.Direction == "recv" {
-		dir = cyan + "← recv" + reset
-	}
+	var req map[string]any
+	_ = json.Unmarshal([]byte(e.Request), &req)
+	var res map[string]any
+	_ = json.Unmarshal([]byte(e.Response), &res)
 
-	fmt.Printf("%s[%s]%s %s  %s  %-10s  %-25s  %6.0fms  PID:%-6d  Host:%s\n",
+	method, _ := req["method"].(string)
+	path, _ := req["path"].(string)
+	status := 0
+	if v, ok := res["status"].(float64); ok {
+		status = int(v)
+	}
+	statusStr := colorStatus(status)
+
+	// Header: one compact line with the key routing info
+	fmt.Printf("%s[%s]%s %s  %-6s %s  %s  %5.0fms  %s\n",
 		gray, ts, reset,
-		tag, dir, e.ContentType, e.Peer, e.LatencyMs, e.PID, e.Host)
+		tag,
+		method, truncate(path, 60),
+		statusStr,
+		e.LatencyMs,
+		gray+fmt.Sprintf("%s • PID %d • %s", e.Peer, e.PID, e.Host)+reset,
+	)
+
+	reqBody := req["body"]
+	resBody := res["body"]
 
 	if p.verbose {
-		fmt.Printf("  %sREQ:%s %s\n", gray, reset, pretty(e.Request))
-		fmt.Printf("  %sRES:%s %s\n", gray, reset, pretty(e.Response))
+		fmt.Printf("  %sreq%s  %s\n", gray, reset, prettyIndent(reqBody))
+		fmt.Printf("  %sres%s  %s\n", gray, reset, prettyIndent(resBody))
 	} else {
-		fmt.Printf("  %sREQ:%s %s\n", gray, reset, truncate(e.Request, 120))
-		fmt.Printf("  %sRES:%s %s\n", gray, reset, truncate(e.Response, 120))
+		fmt.Printf("  %sreq%s  %s\n", gray, reset, summarizeBody(reqBody, 140))
+		fmt.Printf("  %sres%s  %s\n", gray, reset, summarizeBody(resBody, 140))
 	}
 	fmt.Println(strings.Repeat("─", 90))
 }
 
-func pretty(s string) string {
-	var v any
-	if json.Unmarshal([]byte(s), &v) != nil {
-		return s
+func colorStatus(s int) string {
+	if s == 0 {
+		return gray + "---" + reset
 	}
-	b, _ := json.MarshalIndent(v, "        ", "  ")
-	return "\n        " + string(b)
+	str := fmt.Sprintf("%d", s)
+	switch {
+	case s >= 500:
+		return red + bold + str + reset
+	case s >= 400:
+		return red + str + reset
+	case s >= 300:
+		return yellow + str + reset
+	case s >= 200:
+		return green + str + reset
+	}
+	return str
+}
+
+// summarizeBody produces a short, human-oriented preview. For SSE merged
+// results it surfaces the extracted text; for objects it shows a compact
+// inline JSON; for strings it truncates directly.
+func summarizeBody(body any, maxLen int) string {
+	if body == nil {
+		return gray + "(empty)" + reset
+	}
+	switch v := body.(type) {
+	case string:
+		if v == "" {
+			return gray + "(empty)" + reset
+		}
+		return fmt.Sprintf("%q", truncate(v, maxLen))
+	case map[string]any:
+		// SSE merged shape: {"text": "...", "chunks": N, "finishReason": "..."}
+		if text, ok := v["text"].(string); ok {
+			suffix := ""
+			if chunks, ok := v["chunks"].(float64); ok {
+				reason, _ := v["finishReason"].(string)
+				if reason != "" {
+					suffix = fmt.Sprintf("  %s(%d chunks, %s)%s", gray, int(chunks), reason, reset)
+				} else {
+					suffix = fmt.Sprintf("  %s(%d chunks)%s", gray, int(chunks), reset)
+				}
+			}
+			return fmt.Sprintf("%q%s", truncate(text, maxLen), suffix)
+		}
+	}
+	// Fallback: marshal and truncate
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return truncate(fmt.Sprintf("%v", body), maxLen)
+	}
+	return truncate(string(raw), maxLen)
+}
+
+func prettyIndent(v any) string {
+	b, err := json.MarshalIndent(v, "      ", "  ")
+	if err != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	return "\n      " + string(b)
 }
 
 func truncate(s string, max int) string {

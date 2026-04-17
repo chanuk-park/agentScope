@@ -247,6 +247,13 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 	reqBody := s.reqBody.Bytes()
 	resBody := s.resBody.Bytes()
 
+	var resBodyJSON any
+	if isSSEResponse(s.resHeaders) {
+		resBodyJSON = decodeSSEBody(resBody)
+	} else {
+		resBodyJSON = tryJSON(resBody)
+	}
+
 	reqJSON, _ := json.Marshal(map[string]any{
 		"method": method,
 		"path":   path,
@@ -258,7 +265,7 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 	}
 	resJSON, _ := json.Marshal(map[string]any{
 		"status": statusCode,
-		"body":   tryJSON(resBody),
+		"body":   resBodyJSON,
 	})
 
 	latency := float64(0)

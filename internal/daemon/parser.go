@@ -7,9 +7,11 @@ import (
 	"compress/zlib"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,6 +42,7 @@ var llmHosts = map[string]bool{
 }
 
 type parser struct {
+	mu       sync.Mutex
 	writeBuf map[connKey][]byte
 	readBuf  map[connKey][]byte
 	reqTime  map[connKey]time.Time
@@ -47,6 +50,43 @@ type parser struct {
 	h2       map[connKey]*h2Conn
 	proto    map[connKey]byte // 0 = unknown, 1 = http/1, 2 = http/2
 	hostname string
+}
+
+// evictPID removes every connKey entry tied to pid across all buffer maps.
+// Called by the PID scanner when a tracked agent process exits — otherwise
+// long-running daemons would slowly accumulate dead-PID buffers.
+func (p *parser) evictPID(pid uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := connKey{Host: p.hostname, PID: pid}
+	evicted := 0
+	if _, ok := p.writeBuf[key]; ok {
+		delete(p.writeBuf, key)
+		evicted++
+	}
+	if _, ok := p.readBuf[key]; ok {
+		delete(p.readBuf, key)
+		evicted++
+	}
+	if _, ok := p.reqTime[key]; ok {
+		delete(p.reqTime, key)
+		evicted++
+	}
+	if _, ok := p.lastReq[key]; ok {
+		delete(p.lastReq, key)
+		evicted++
+	}
+	if _, ok := p.h2[key]; ok {
+		delete(p.h2, key)
+		evicted++
+	}
+	if _, ok := p.proto[key]; ok {
+		delete(p.proto, key)
+		evicted++
+	}
+	if evicted > 0 {
+		log.Printf("parser: evicted %d map entries for dead pid=%d", evicted, pid)
+	}
 }
 
 func newParser(hostOverride string) *parser {
@@ -66,6 +106,8 @@ func newParser(hostOverride string) *parser {
 }
 
 func (p *parser) feed(raw RawEvent) *AgentEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	key := connKey{Host: p.hostname, PID: raw.PID}
 
 	// Protocol detection on first meaningful write. HTTP/2 connection always
@@ -256,6 +298,13 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 	reqBody := decodeBody(readAll(req.Body), req.Header.Get("Content-Encoding"))
 	resBody := decodeBody(readAll(res.Body), res.Header.Get("Content-Encoding"))
 
+	var resBodyJSON any
+	if isSSEContentType(res.Header.Get("Content-Type")) {
+		resBodyJSON = decodeSSEBody(resBody)
+	} else {
+		resBodyJSON = tryJSON(resBody)
+	}
+
 	reqJSON, _ := json.Marshal(map[string]any{
 		"method": req.Method,
 		"path":   req.URL.Path,
@@ -263,7 +312,7 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 	})
 	resJSON, _ := json.Marshal(map[string]any{
 		"status": res.StatusCode,
-		"body":   tryJSON(resBody),
+		"body":   resBodyJSON,
 	})
 
 	return &AgentEvent{
@@ -383,4 +432,153 @@ func tryJSON(b []byte) any {
 		return v
 	}
 	return string(b)
+}
+
+// decodeSSEBody parses a Server-Sent Events body and merges the deltas into
+// a single response. Text fragments from provider-specific delta formats
+// (OpenAI `choices[].delta.content`, Anthropic `delta.text`, Gemini
+// `candidates[].content.parts[].text`, plus simple `delta` / `text` /
+// `content` strings) are concatenated. The terminal `[DONE]` sentinel
+// and non-`data:` framing lines are ignored. Useful metadata from the
+// final event (finishReason, usageMetadata, modelVersion, responseId) is
+// preserved so callers can still see why generation stopped and how many
+// tokens were consumed. If no text can be extracted the raw event list
+// is returned instead.
+func decodeSSEBody(b []byte) any {
+	if len(b) == 0 {
+		return ""
+	}
+	events := []any{}
+	for _, raw := range bytes.Split(b, []byte("\n")) {
+		line := bytes.TrimRight(raw, "\r")
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(payload, &v); err == nil {
+			events = append(events, v)
+		} else {
+			events = append(events, string(payload))
+		}
+	}
+	if len(events) == 0 {
+		return string(b)
+	}
+	return mergeSSEEvents(events)
+}
+
+func mergeSSEEvents(events []any) any {
+	var buf strings.Builder
+	var lastObj map[string]any
+	for _, e := range events {
+		obj, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		lastObj = obj
+		buf.WriteString(extractSSEText(obj))
+	}
+	if buf.Len() == 0 {
+		// No text extracted — keep the event list verbatim so debugging info isn't lost.
+		return events
+	}
+	out := map[string]any{
+		"text":   buf.String(),
+		"chunks": len(events),
+	}
+	if lastObj != nil {
+		for _, k := range []string{"finishReason", "modelVersion", "responseId", "usageMetadata", "model", "id"} {
+			if v, ok := lastObj[k]; ok {
+				out[k] = v
+			}
+		}
+		// Gemini nests finishReason inside candidates[0].
+		if _, has := out["finishReason"]; !has {
+			if cands, ok := lastObj["candidates"].([]any); ok && len(cands) > 0 {
+				if c0, ok := cands[0].(map[string]any); ok {
+					if fr, ok := c0["finishReason"]; ok {
+						out["finishReason"] = fr
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func extractSSEText(ev map[string]any) string {
+	// Gemini: candidates[*].content.parts[*].text
+	if cands, ok := ev["candidates"].([]any); ok {
+		var b strings.Builder
+		for _, c := range cands {
+			co, _ := c.(map[string]any)
+			if co == nil {
+				continue
+			}
+			content, _ := co["content"].(map[string]any)
+			if content == nil {
+				continue
+			}
+			parts, _ := content["parts"].([]any)
+			for _, p := range parts {
+				po, _ := p.(map[string]any)
+				if po == nil {
+					continue
+				}
+				if t, ok := po["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+		if b.Len() > 0 {
+			return b.String()
+		}
+	}
+	// OpenAI: choices[*].delta.content
+	if choices, ok := ev["choices"].([]any); ok {
+		var b strings.Builder
+		for _, c := range choices {
+			co, _ := c.(map[string]any)
+			if co == nil {
+				continue
+			}
+			delta, _ := co["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			if t, ok := delta["content"].(string); ok {
+				b.WriteString(t)
+			}
+		}
+		if b.Len() > 0 {
+			return b.String()
+		}
+	}
+	// Anthropic: delta.text (content_block_delta events)
+	if delta, ok := ev["delta"].(map[string]any); ok {
+		if t, ok := delta["text"].(string); ok {
+			return t
+		}
+	}
+	// Generic fallbacks
+	if s, ok := ev["delta"].(string); ok {
+		return s
+	}
+	if s, ok := ev["text"].(string); ok {
+		return s
+	}
+	if s, ok := ev["content"].(string); ok {
+		return s
+	}
+	return ""
+}
+
+// isSSEContentType reports whether the given Content-Type header value
+// represents a Server-Sent Events stream.
+func isSSEContentType(ct string) bool {
+	return strings.Contains(strings.ToLower(ct), "text/event-stream")
 }

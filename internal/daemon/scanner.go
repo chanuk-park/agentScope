@@ -46,12 +46,13 @@ var agentCmdlineMarkers = [][]byte{
 
 type pidScanner struct {
 	m        *ebpf.Map
+	p        *parser // parser receives eviction for dead PIDs
 	interval time.Duration
 	tracked  map[uint32]struct{}
 }
 
-func newPIDScanner(m *ebpf.Map, interval time.Duration) *pidScanner {
-	return &pidScanner{m: m, interval: interval, tracked: map[uint32]struct{}{}}
+func newPIDScanner(m *ebpf.Map, p *parser, interval time.Duration) *pidScanner {
+	return &pidScanner{m: m, p: p, interval: interval, tracked: map[uint32]struct{}{}}
 }
 
 func (s *pidScanner) run(stop <-chan struct{}) {
@@ -90,6 +91,9 @@ func (s *pidScanner) sync() {
 		_ = s.m.Delete(pid)
 		delete(s.tracked, pid)
 		removed++
+		if s.p != nil {
+			s.p.evictPID(pid)
+		}
 	}
 	if added > 0 || removed > 0 {
 		log.Printf("agent filter: tracked=%d (+%d -%d)", len(s.tracked), added, removed)

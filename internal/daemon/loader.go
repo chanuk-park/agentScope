@@ -86,7 +86,7 @@ func Run(masterAddr, hostOverride string, stop chan os.Signal) {
 	go sender.run()
 
 	scannerStop := make(chan struct{})
-	scanner := newPIDScanner(objs.AgentPids, 200*time.Millisecond)
+	scanner := newPIDScanner(objs.AgentPids, parser, 200*time.Millisecond)
 	go scanner.run(scannerStop)
 	log.Printf("agent filter active (scanning /proc every 200ms)")
 
