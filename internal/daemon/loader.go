@@ -81,8 +81,12 @@ func Run(masterAddr, hostOverride string, configPeers map[string]string, stop ch
 	}
 	defer rd.Close()
 
-	parser := newParser(hostOverride, configPeers)
-	sender := newSender(masterAddr)
+	hostname := hostOverride
+	if hostname == "" {
+		hostname, _ = os.Hostname()
+	}
+	parser := newParser(hostname, configPeers)
+	sender := newSender(masterAddr, hostname)
 	go sender.run()
 
 	scannerStop := make(chan struct{})

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -116,11 +115,7 @@ func (p *parser) evictPID(pid uint32) {
 	}
 }
 
-func newParser(hostOverride string, configPeers map[string]string) *parser {
-	h := hostOverride
-	if h == "" {
-		h, _ = os.Hostname()
-	}
+func newParser(hostname string, configPeers map[string]string) *parser {
 	if configPeers == nil {
 		configPeers = map[string]string{}
 	}
@@ -131,7 +126,7 @@ func newParser(hostOverride string, configPeers map[string]string) *parser {
 		lastReq:      make(map[connKey]*http.Request),
 		h2:           make(map[connKey]*h2Conn),
 		proto:        make(map[connKey]byte),
-		hostname:     h,
+		hostname:     hostname,
 		llmEndpoints: make(map[string]struct{}),
 		mcpEndpoints: make(map[string]struct{}),
 		configPeers:  configPeers,

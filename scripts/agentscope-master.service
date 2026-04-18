@@ -1,0 +1,16 @@
+[Unit]
+Description=AgentScope master (terminal renderer for agent traffic)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agentscoped -mode master -listen :9000 -v
+Restart=on-failure
+RestartSec=2s
+# master runs unprivileged
+User=agentscope
+StandardOutput=append:/var/log/agentscope/master.log
+StandardError=append:/var/log/agentscope/master.log
+
+[Install]
+WantedBy=multi-user.target
