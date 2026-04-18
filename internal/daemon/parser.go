@@ -50,7 +50,22 @@ type parser struct {
 	h2       map[connKey]*h2Conn
 	proto    map[connKey]byte // 0 = unknown, 1 = http/1, 2 = http/2
 	hostname string
+
+	// mcpEndpoints remembers peers (host:port) confirmed as MCP servers via
+	// the JSON-RPC 2.0 `initialize` handshake (a `protocolVersion` param is
+	// an MCP-spec-only field). Once tagged, every subsequent call to that
+	// peer is classified as Agent↔MCP in O(1) without inspecting the body.
+	//
+	// Scope is intentionally *not* tied to PID lifecycle: MCP endpoints are
+	// long-lived host/port pairs that outlive any one agent. Evicting on
+	// PID death would cause a later agent reusing the same MCP server to be
+	// misclassified as Agent↔Agent until the next initialize round-trip.
+	// Size is bounded by `maxMCPEndpoints` so an adversarial or runaway
+	// caller can't grow the map unbounded.
+	mcpEndpoints map[string]struct{}
 }
+
+const maxMCPEndpoints = 1024
 
 // evictPID removes every connKey entry tied to pid across all buffer maps.
 // Called by the PID scanner when a tracked agent process exits — otherwise
@@ -95,13 +110,14 @@ func newParser(hostOverride string) *parser {
 		h, _ = os.Hostname()
 	}
 	return &parser{
-		writeBuf: make(map[connKey][]byte),
-		readBuf:  make(map[connKey][]byte),
-		reqTime:  make(map[connKey]time.Time),
-		lastReq:  make(map[connKey]*http.Request),
-		h2:       make(map[connKey]*h2Conn),
-		proto:    make(map[connKey]byte),
-		hostname: h,
+		writeBuf:     make(map[connKey][]byte),
+		readBuf:      make(map[connKey][]byte),
+		reqTime:      make(map[connKey]time.Time),
+		lastReq:      make(map[connKey]*http.Request),
+		h2:           make(map[connKey]*h2Conn),
+		proto:        make(map[connKey]byte),
+		hostname:     h,
+		mcpEndpoints: make(map[string]struct{}),
 	}
 }
 
@@ -115,7 +131,7 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 	if p.proto[key] == 0 && raw.Type == 0 {
 		if looksLikeH2Preface(raw.Data) {
 			p.proto[key] = 2
-			p.h2[key] = newH2Conn()
+			p.h2[key] = newH2Conn(p.mcpEndpoints)
 		} else if looksLikeHTTP(raw.Data) {
 			p.proto[key] = 1
 		}
@@ -320,7 +336,7 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 		PID:         key.PID,
 		Timestamp:   float64(time.Now().UnixMilli()) / 1000,
 		Direction:   "send",
-		CommType:    classifyComm(req.Host, reqBody, resBody),
+		CommType:    classifyComm(req.Host, reqBody, resBody, p.mcpEndpoints),
 		ContentType: classifyContent(reqBody),
 		Peer:        req.Host,
 		Request:     string(reqJSON),
@@ -329,30 +345,85 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 	}
 }
 
-func classifyComm(peer string, reqBody, resBody []byte) string {
+// classifyComm decides the comm type. `mcpReg` is a shared map of
+// confirmed-MCP peers; classifyComm reads it for O(1) hits and writes a
+// new entry whenever it can prove this peer speaks MCP (initialize
+// handshake with `protocolVersion`, or a method in the MCP namespace).
+// The map is expected to be accessed under the parser mutex.
+func classifyComm(peer string, reqBody, resBody []byte, mcpReg map[string]struct{}) string {
 	host := strings.Split(peer, ":")[0]
 	if llmHosts[host] {
 		return "Agent↔Model"
 	}
+
+	// Already-tagged MCP endpoint: skip the body scan entirely.
+	if _, ok := mcpReg[peer]; ok {
+		return "Agent↔MCP"
+	}
+
+	// Strong signal: JSON-RPC 2.0 `initialize` with `params.protocolVersion`
+	// is unique to the MCP lifecycle spec. Register the peer on hit.
+	for _, body := range [][]byte{reqBody, resBody} {
+		if isInitializeHandshake(body) {
+			registerMCP(mcpReg, peer)
+			return "Agent↔MCP"
+		}
+	}
+
+	// Fallback: JSON-RPC method lives in the MCP namespace (tools, resources,
+	// prompts). Useful when the daemon attached mid-session and missed the
+	// initialize handshake. Still stricter than the previous "any jsonrpc
+	// result is MCP" rule that misclassified generic JSON-RPC services.
 	for _, body := range [][]byte{reqBody, resBody} {
 		var j map[string]any
 		if json.Unmarshal(body, &j) != nil || j["jsonrpc"] != "2.0" {
 			continue
 		}
-		if m, _ := j["method"].(string); strings.HasPrefix(m, "tools/") ||
+		m, _ := j["method"].(string)
+		if strings.HasPrefix(m, "tools/") ||
 			strings.HasPrefix(m, "resources/") ||
-			strings.HasPrefix(m, "prompts/") ||
-			m == "initialize" {
-			return "Agent↔MCP"
-		}
-		// Response side: method may not exist, but "result"/"error" with jsonrpc
-		// indicates JSON-RPC protocol. Peer host decides whether it is MCP —
-		// MCP typically doesn't live on llmHosts, so treat jsonrpc 2.0 as MCP.
-		if _, ok := j["result"]; ok {
+			strings.HasPrefix(m, "prompts/") {
+			registerMCP(mcpReg, peer)
 			return "Agent↔MCP"
 		}
 	}
 	return "Agent↔Agent"
+}
+
+// isInitializeHandshake returns true when body is an MCP `initialize`
+// request (or response echoing one). MCP mandates `params.protocolVersion`
+// in the spec; no other JSON-RPC 2.0 service uses this exact shape.
+func isInitializeHandshake(body []byte) bool {
+	var j map[string]any
+	if json.Unmarshal(body, &j) != nil {
+		return false
+	}
+	if j["jsonrpc"] != "2.0" {
+		return false
+	}
+	if j["method"] != "initialize" {
+		return false
+	}
+	params, ok := j["params"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, has := params["protocolVersion"]
+	return has
+}
+
+func registerMCP(mcpReg map[string]struct{}, peer string) {
+	if peer == "" {
+		return
+	}
+	if _, ok := mcpReg[peer]; ok {
+		return
+	}
+	if len(mcpReg) >= maxMCPEndpoints {
+		return // cap hit — refuse new registration rather than evicting arbitrary entry
+	}
+	mcpReg[peer] = struct{}{}
+	log.Printf("parser: MCP endpoint registered: %s (total=%d)", peer, len(mcpReg))
 }
 
 func classifyContent(body []byte) string {
