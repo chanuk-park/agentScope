@@ -52,15 +52,19 @@ type h2Conn struct {
 	recvDec         *hpack.Decoder
 	streams         map[uint32]*h2Stream
 	prefaceConsumed bool
+	cfgPeers        map[string]string   // shared reference to parser.configPeers
+	llmReg          map[string]struct{} // shared reference to parser.llmEndpoints
 	mcpReg          map[string]struct{} // shared reference to parser.mcpEndpoints
 }
 
-func newH2Conn(mcpReg map[string]struct{}) *h2Conn {
+func newH2Conn(cfgPeers map[string]string, llmReg, mcpReg map[string]struct{}) *h2Conn {
 	return &h2Conn{
-		sendDec: hpack.NewDecoder(4096, nil),
-		recvDec: hpack.NewDecoder(4096, nil),
-		streams: make(map[uint32]*h2Stream),
-		mcpReg:  mcpReg,
+		sendDec:  hpack.NewDecoder(4096, nil),
+		recvDec:  hpack.NewDecoder(4096, nil),
+		streams:  make(map[uint32]*h2Stream),
+		cfgPeers: cfgPeers,
+		llmReg:   llmReg,
+		mcpReg:   mcpReg,
 	}
 }
 
@@ -280,7 +284,7 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 		PID:         pid,
 		Timestamp:   float64(time.Now().UnixMilli()) / 1000,
 		Direction:   "send",
-		CommType:    classifyComm(authority, reqBody, resBody, c.mcpReg),
+		CommType:    classifyComm(authority, method, path, reqBody, resBody, c.cfgPeers, c.llmReg, c.mcpReg),
 		ContentType: classifyContent(reqBody),
 		Peer:        authority,
 		Request:     string(reqJSON),

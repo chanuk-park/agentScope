@@ -51,21 +51,33 @@ type parser struct {
 	proto    map[connKey]byte // 0 = unknown, 1 = http/1, 2 = http/2
 	hostname string
 
-	// mcpEndpoints remembers peers (host:port) confirmed as MCP servers via
-	// the JSON-RPC 2.0 `initialize` handshake (a `protocolVersion` param is
-	// an MCP-spec-only field). Once tagged, every subsequent call to that
-	// peer is classified as Agent↔MCP in O(1) without inspecting the body.
+	// llmEndpoints / mcpEndpoints remember peers (host:port) after a
+	// protocol-specific signature is observed. Once tagged, subsequent
+	// calls to the same peer are classified in O(1) without re-inspecting
+	// the body. Intentionally *not* tied to PID lifecycle: endpoints are
+	// long-lived host/port pairs that outlive any one agent.
 	//
-	// Scope is intentionally *not* tied to PID lifecycle: MCP endpoints are
-	// long-lived host/port pairs that outlive any one agent. Evicting on
-	// PID death would cause a later agent reusing the same MCP server to be
-	// misclassified as Agent↔Agent until the next initialize round-trip.
-	// Size is bounded by `maxMCPEndpoints` so an adversarial or runaway
-	// caller can't grow the map unbounded.
+	// llmEndpoints is populated by response-shape detection (OpenAI-compat,
+	// Anthropic, Ollama, Gemini native). This covers self-hosted LLMs
+	// (vLLM, Ollama, LiteLLM proxy) whose hostnames aren't in llmHosts.
+	//
+	// mcpEndpoints is populated by the MCP `initialize` handshake
+	// (`params.protocolVersion`), or by the MCP method namespace fallback
+	// (tools/*, resources/*, prompts/*) when the daemon joins mid-session.
+	llmEndpoints map[string]struct{}
 	mcpEndpoints map[string]struct{}
+
+	// configPeers is a read-only map of user-declared comm-type overrides
+	// loaded from the YAML config + `-peer` CLI flags. Consulted *before*
+	// any heuristic in classifyComm, so operators can force-tag endpoints
+	// the automatic detection gets wrong or can't yet recognise.
+	configPeers map[string]string
 }
 
-const maxMCPEndpoints = 1024
+const (
+	maxLLMEndpoints = 1024
+	maxMCPEndpoints = 1024
+)
 
 // evictPID removes every connKey entry tied to pid across all buffer maps.
 // Called by the PID scanner when a tracked agent process exits — otherwise
@@ -104,10 +116,13 @@ func (p *parser) evictPID(pid uint32) {
 	}
 }
 
-func newParser(hostOverride string) *parser {
+func newParser(hostOverride string, configPeers map[string]string) *parser {
 	h := hostOverride
 	if h == "" {
 		h, _ = os.Hostname()
+	}
+	if configPeers == nil {
+		configPeers = map[string]string{}
 	}
 	return &parser{
 		writeBuf:     make(map[connKey][]byte),
@@ -117,7 +132,9 @@ func newParser(hostOverride string) *parser {
 		h2:           make(map[connKey]*h2Conn),
 		proto:        make(map[connKey]byte),
 		hostname:     h,
+		llmEndpoints: make(map[string]struct{}),
 		mcpEndpoints: make(map[string]struct{}),
+		configPeers:  configPeers,
 	}
 }
 
@@ -131,7 +148,7 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 	if p.proto[key] == 0 && raw.Type == 0 {
 		if looksLikeH2Preface(raw.Data) {
 			p.proto[key] = 2
-			p.h2[key] = newH2Conn(p.mcpEndpoints)
+			p.h2[key] = newH2Conn(p.configPeers, p.llmEndpoints, p.mcpEndpoints)
 		} else if looksLikeHTTP(raw.Data) {
 			p.proto[key] = 1
 		}
@@ -336,7 +353,7 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 		PID:         key.PID,
 		Timestamp:   float64(time.Now().UnixMilli()) / 1000,
 		Direction:   "send",
-		CommType:    classifyComm(req.Host, reqBody, resBody, p.mcpEndpoints),
+		CommType:    classifyComm(req.Host, req.Method, req.URL.Path, reqBody, resBody, p.configPeers, p.llmEndpoints, p.mcpEndpoints),
 		ContentType: classifyContent(reqBody),
 		Peer:        req.Host,
 		Request:     string(reqJSON),
@@ -345,54 +362,150 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 	}
 }
 
-// classifyComm decides the comm type. `mcpReg` is a shared map of
-// confirmed-MCP peers; classifyComm reads it for O(1) hits and writes a
-// new entry whenever it can prove this peer speaks MCP (initialize
-// handshake with `protocolVersion`, or a method in the MCP namespace).
-// The map is expected to be accessed under the parser mutex.
-func classifyComm(peer string, reqBody, resBody []byte, mcpReg map[string]struct{}) string {
+// classifyComm returns the comm-type label. Ordering matters:
+//
+//  1. configPeers — user-declared overrides (YAML + -peer flag), highest priority
+//  2. llmHosts — static well-known LLM API hostnames (O(1), short-circuit)
+//  3. llmEndpoints / mcpEndpoints — peers previously tagged by signature
+//  4. isLLMResponse — OpenAI/Anthropic/Ollama/Gemini response shape → register + Model
+//  5. isInitializeHandshake — MCP initialize round-trip → register + MCP
+//  6. MCP method fallback — tools/*, resources/*, prompts/* for mid-session attach
+//  7. isA2AProtocol — Google A2A tasks/* or /.well-known/agent.json
+//  8. isLangGraphProtocol — /threads, /runs/{wait,stream,batch}
+//  9. Unknown — everything else (health checks, metrics, unknown services)
+//
+// Maps are accessed under the parser mutex.
+func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers map[string]string, llmReg, mcpReg map[string]struct{}) string {
 	host := strings.Split(peer, ":")[0]
+
+	// 1. Explicit user override — full peer first, then bare host fallback
+	//    (so a user writing "api.openai.com" matches both "api.openai.com"
+	//    and "api.openai.com:443" forms).
+	if v, ok := cfgPeers[peer]; ok {
+		return v
+	}
+	if host != peer {
+		if v, ok := cfgPeers[host]; ok {
+			return v
+		}
+	}
+
 	if llmHosts[host] {
 		return "Agent↔Model"
 	}
 
-	// Already-tagged MCP endpoint: skip the body scan entirely.
+	// Fast paths for already-registered endpoints.
+	if _, ok := llmReg[peer]; ok {
+		return "Agent↔Model"
+	}
 	if _, ok := mcpReg[peer]; ok {
 		return "Agent↔MCP"
 	}
 
-	// Strong signal: JSON-RPC 2.0 `initialize` with `params.protocolVersion`
-	// is unique to the MCP lifecycle spec. Register the peer on hit.
+	// LLM response fingerprint (covers Ollama / vLLM / LiteLLM self-hosted).
+	if isLLMResponse(resBody) {
+		registerEndpoint(llmReg, peer, maxLLMEndpoints, "LLM")
+		return "Agent↔Model"
+	}
+
+	// MCP: strong signal = initialize handshake with protocolVersion.
 	for _, body := range [][]byte{reqBody, resBody} {
 		if isInitializeHandshake(body) {
-			registerMCP(mcpReg, peer)
+			registerEndpoint(mcpReg, peer, maxMCPEndpoints, "MCP")
 			return "Agent↔MCP"
 		}
 	}
 
-	// Fallback: JSON-RPC method lives in the MCP namespace (tools, resources,
-	// prompts). Useful when the daemon attached mid-session and missed the
-	// initialize handshake. Still stricter than the previous "any jsonrpc
-	// result is MCP" rule that misclassified generic JSON-RPC services.
+	// MCP fallback: tools/*, resources/*, prompts/* method in JSON-RPC body.
 	for _, body := range [][]byte{reqBody, resBody} {
-		var j map[string]any
-		if json.Unmarshal(body, &j) != nil || j["jsonrpc"] != "2.0" {
-			continue
-		}
-		m, _ := j["method"].(string)
-		if strings.HasPrefix(m, "tools/") ||
-			strings.HasPrefix(m, "resources/") ||
-			strings.HasPrefix(m, "prompts/") {
-			registerMCP(mcpReg, peer)
+		if hasMCPMethod(body) {
+			registerEndpoint(mcpReg, peer, maxMCPEndpoints, "MCP")
 			return "Agent↔MCP"
 		}
 	}
-	return "Agent↔Agent"
+
+	// Agent↔Agent: only when we can identify the protocol explicitly.
+	if isA2AProtocol(reqBody, method, path) {
+		return "Agent↔Agent"
+	}
+	if isLangGraphProtocol(path) {
+		return "Agent↔Agent"
+	}
+
+	return "Unknown"
+}
+
+// isLLMResponse detects the canonical response shape of the major LLM
+// providers. Works on both plain JSON bodies and raw SSE bodies (looks
+// inside the first `data:` event payload).
+func isLLMResponse(body []byte) bool {
+	if matchLLMShape(body) {
+		return true
+	}
+	// SSE: scan a bounded number of data: lines from the front.
+	if bytes.Contains(body, []byte("\ndata:")) || bytes.HasPrefix(body, []byte("data:")) {
+		scanned := 0
+		for _, line := range bytes.Split(body, []byte("\n")) {
+			line = bytes.TrimRight(line, "\r")
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			payload := bytes.TrimSpace(line[len("data:"):])
+			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+				continue
+			}
+			if matchLLMShape(payload) {
+				return true
+			}
+			scanned++
+			if scanned >= 4 {
+				break
+			}
+		}
+	}
+	return false
+}
+
+func matchLLMShape(body []byte) bool {
+	var j map[string]any
+	if json.Unmarshal(body, &j) != nil {
+		return false
+	}
+	// OpenAI chat/text completions (incl. streaming "chat.completion.chunk")
+	if obj, _ := j["object"].(string); strings.HasPrefix(obj, "chat.completion") ||
+		obj == "text_completion" {
+		return true
+	}
+	// Anthropic non-streaming messages
+	if j["type"] == "message" && j["role"] == "assistant" {
+		return true
+	}
+	// Anthropic streaming first event
+	if j["type"] == "message_start" {
+		if m, _ := j["message"].(map[string]any); m != nil {
+			if m["type"] == "message" && m["role"] == "assistant" {
+				return true
+			}
+		}
+	}
+	// Ollama native (/api/chat, /api/generate): "done" and "model" present
+	_, hasDone := j["done"]
+	_, hasModel := j["model"]
+	if hasDone && hasModel {
+		return true
+	}
+	// Gemini native (:generateContent, :streamGenerateContent)
+	_, hasCandidates := j["candidates"]
+	_, hasModelVersion := j["modelVersion"]
+	if hasCandidates && hasModelVersion {
+		return true
+	}
+	return false
 }
 
 // isInitializeHandshake returns true when body is an MCP `initialize`
-// request (or response echoing one). MCP mandates `params.protocolVersion`
-// in the spec; no other JSON-RPC 2.0 service uses this exact shape.
+// request. MCP mandates `params.protocolVersion`; no other JSON-RPC 2.0
+// service uses this exact shape.
 func isInitializeHandshake(body []byte) bool {
 	var j map[string]any
 	if json.Unmarshal(body, &j) != nil {
@@ -412,18 +525,72 @@ func isInitializeHandshake(body []byte) bool {
 	return has
 }
 
-func registerMCP(mcpReg map[string]struct{}, peer string) {
+// hasMCPMethod returns true if body is a JSON-RPC 2.0 request whose method
+// is in the MCP namespace (tools/*, resources/*, prompts/*). Used as a
+// fallback when the daemon joins an MCP session mid-way.
+func hasMCPMethod(body []byte) bool {
+	var j map[string]any
+	if json.Unmarshal(body, &j) != nil || j["jsonrpc"] != "2.0" {
+		return false
+	}
+	m, _ := j["method"].(string)
+	return strings.HasPrefix(m, "tools/") ||
+		strings.HasPrefix(m, "resources/") ||
+		strings.HasPrefix(m, "prompts/")
+}
+
+// isA2AProtocol detects Google Agent-to-Agent protocol traffic.
+func isA2AProtocol(reqBody []byte, method, path string) bool {
+	// Agent Card discovery: GET /.well-known/agent.json
+	cleanPath := path
+	if i := strings.IndexByte(cleanPath, '?'); i >= 0 {
+		cleanPath = cleanPath[:i]
+	}
+	if method == "GET" && strings.HasSuffix(cleanPath, "/.well-known/agent.json") {
+		return true
+	}
+	// JSON-RPC 2.0 tasks/* methods.
+	var j map[string]any
+	if json.Unmarshal(reqBody, &j) == nil && j["jsonrpc"] == "2.0" {
+		if m, _ := j["method"].(string); strings.HasPrefix(m, "tasks/") {
+			return true
+		}
+	}
+	return false
+}
+
+// isLangGraphProtocol detects LangGraph Agent Protocol REST endpoints.
+// Matches only the specific paths from the spec (POST /threads, runs
+// subpaths) to avoid false positives from generic `/runs` or `/threads`
+// endpoints in unrelated services.
+func isLangGraphProtocol(path string) bool {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path == "/threads" || strings.HasPrefix(path, "/threads/") {
+		return true
+	}
+	switch path {
+	case "/runs", "/runs/wait", "/runs/stream", "/runs/batch":
+		return true
+	}
+	return false
+}
+
+// registerEndpoint adds peer to reg, capped at max. Emits a log line the
+// first time a peer is registered so operators see classifier state grow.
+func registerEndpoint(reg map[string]struct{}, peer string, max int, label string) {
 	if peer == "" {
 		return
 	}
-	if _, ok := mcpReg[peer]; ok {
+	if _, ok := reg[peer]; ok {
 		return
 	}
-	if len(mcpReg) >= maxMCPEndpoints {
-		return // cap hit — refuse new registration rather than evicting arbitrary entry
+	if len(reg) >= max {
+		return
 	}
-	mcpReg[peer] = struct{}{}
-	log.Printf("parser: MCP endpoint registered: %s (total=%d)", peer, len(mcpReg))
+	reg[peer] = struct{}{}
+	log.Printf("parser: %s endpoint registered: %s (total=%d)", label, peer, len(reg))
 }
 
 func classifyContent(body []byte) string {

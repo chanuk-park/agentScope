@@ -1,3 +1,5 @@
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -output-dir internal/daemon SslTrace bpf/ssl_trace.bpf.c -- -I/usr/include/x86_64-linux-gnu -I/usr/include -D__TARGET_ARCH_x86
+
 package main
 
 import (
@@ -17,6 +19,9 @@ func main() {
 	listen := flag.String("listen", ":9000", "listen 주소 (master mode)")
 	verbose := flag.Bool("v", false, "body 전체 출력")
 	host := flag.String("host", "", "hostname override (daemon mode, for multi-daemon demo)")
+	configPath := flag.String("config", "./agentscope.yaml", "YAML config path (missing file is silently skipped)")
+	var peerPairs []string
+	flag.Var(daemon.NewPeerListFlag(&peerPairs), "peer", "override peer comm type, e.g. -peer '10.0.0.2:8080=Agent↔Agent' (repeatable)")
 	flag.Parse()
 
 	sig := make(chan os.Signal, 1)
@@ -27,7 +32,11 @@ func main() {
 		if os.Geteuid() != 0 {
 			log.Fatal("daemon은 root 필요 (sudo)")
 		}
-		daemon.Run(*masterAddr, *host, sig)
+		overrides, err := daemon.BuildPeerOverrides(*configPath, peerPairs)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		daemon.Run(*masterAddr, *host, overrides, sig)
 	case "master":
 		master.Run(*listen, *verbose, sig)
 	default:

@@ -23,7 +23,7 @@ type RawEvent struct {
 	Data        []byte
 }
 
-func Run(masterAddr, hostOverride string, stop chan os.Signal) {
+func Run(masterAddr, hostOverride string, configPeers map[string]string, stop chan os.Signal) {
 	objs := SslTraceObjects{}
 	if err := LoadSslTraceObjects(&objs, nil); err != nil {
 		log.Fatalf("load bpf: %v", err)
@@ -81,7 +81,7 @@ func Run(masterAddr, hostOverride string, stop chan os.Signal) {
 	}
 	defer rd.Close()
 
-	parser := newParser(hostOverride)
+	parser := newParser(hostOverride, configPeers)
 	sender := newSender(masterAddr)
 	go sender.run()
 

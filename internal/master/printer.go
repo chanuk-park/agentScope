@@ -37,11 +37,15 @@ func newPrinter(verbose bool) *printer { return &printer{verbose} }
 
 func (p *printer) print(e *Event) {
 	ts := time.Unix(0, int64(e.Timestamp*1e9)).Format("15:04:05")
-	tag := map[string]string{
+	tag, ok := map[string]string{
 		"Agent↔Model": blue + "Agent↔Model" + reset,
 		"Agent↔Agent": yellow + "Agent↔Agent" + reset,
 		"Agent↔MCP":   green + "Agent↔MCP  " + reset,
+		"Unknown":     gray + "Unknown    " + reset,
 	}[e.CommType]
+	if !ok {
+		tag = gray + "Unknown    " + reset
+	}
 
 	var req map[string]any
 	_ = json.Unmarshal([]byte(e.Request), &req)
