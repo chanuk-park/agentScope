@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	pb "agentscope/gen/agent"
 )
@@ -47,7 +48,15 @@ func (s *sender) connect() error {
 	defer conn.Close()
 
 	client := pb.NewAgentMonitorClient(conn)
-	stream, err := client.StreamEvents(context.Background())
+	// Attach hostname as gRPC metadata so master can register the (IP→host)
+	// mapping at stream open — before any events arrive. Without this, the
+	// first A2A event from another daemon can race ahead of this daemon's
+	// first event and render with a bare IP peer.
+	ctx := context.Background()
+	if s.hostname != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-agentscope-host", s.hostname)
+	}
+	stream, err := client.StreamEvents(ctx)
 	if err != nil {
 		return err
 	}

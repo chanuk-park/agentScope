@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ type AgentEvent struct {
 type connKey struct {
 	Host string
 	PID  uint32
+	SSL  uint64 // SSL* pointer — distinguishes concurrent TLS conns on same PID
 }
 
 var llmHosts = map[string]bool{
@@ -49,6 +51,25 @@ type parser struct {
 	h2       map[connKey]*h2Conn
 	proto    map[connKey]byte // 0 = unknown, 1 = http/1, 2 = http/2
 	hostname string
+
+	// sseEmittedBytes[key] tracks how many bytes of the SSE response stream
+	// we've already converted into per-frame events. Required because SSE
+	// streams (MCP `GET /sse`, LLM streaming) can stay open for minutes —
+	// we must emit each pushed `data: {...}` frame as it arrives rather
+	// than wait for stream close.
+	sseEmittedBytes map[connKey]int
+
+	// mcpPending pairs MCP `POST /messages/` JSON-RPC requests (which only
+	// receive a `202 Accepted` body) with their eventual result pushed on
+	// the paired GET /sse stream by the server. Keyed by PID (SSE stream
+	// and POST run on different SSL connections, same process) → jsonrpc
+	// request id → buffered request metadata.
+	mcpPending map[uint32]map[float64]*pendingMCPPost
+
+	// emit is called for side-channel events: per-SSE-frame MCP responses,
+	// paired POST/SSE combined events. The primary feed() return value is
+	// used for normal HTTP/1.1 request-response pairs.
+	emit func(*AgentEvent)
 
 	// llmEndpoints / mcpEndpoints remember peers (host:port) after a
 	// protocol-specific signature is observed. Once tagged, subsequent
@@ -73,6 +94,17 @@ type parser struct {
 	configPeers map[string]string
 }
 
+// pendingMCPPost is a POST /messages/ request buffered while we wait for
+// the server to push its JSON-RPC response on the paired SSE stream.
+type pendingMCPPost struct {
+	req      *http.Request
+	method   string
+	toolName string // only set for tools/call — name of the invoked tool
+	arguments any
+	peer     string
+	reqTime  time.Time
+}
+
 const (
 	maxLLMEndpoints = 1024
 	maxMCPEndpoints = 1024
@@ -84,30 +116,49 @@ const (
 func (p *parser) evictPID(pid uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := connKey{Host: p.hostname, PID: pid}
 	evicted := 0
-	if _, ok := p.writeBuf[key]; ok {
-		delete(p.writeBuf, key)
-		evicted++
+	evict := func(m map[connKey][]byte) {
+		for k := range m {
+			if k.PID == pid {
+				delete(m, k)
+				evicted++
+			}
+		}
 	}
-	if _, ok := p.readBuf[key]; ok {
-		delete(p.readBuf, key)
-		evicted++
+	evict(p.writeBuf)
+	evict(p.readBuf)
+	for k := range p.reqTime {
+		if k.PID == pid {
+			delete(p.reqTime, k)
+			evicted++
+		}
 	}
-	if _, ok := p.reqTime[key]; ok {
-		delete(p.reqTime, key)
-		evicted++
+	for k := range p.lastReq {
+		if k.PID == pid {
+			delete(p.lastReq, k)
+			evicted++
+		}
 	}
-	if _, ok := p.lastReq[key]; ok {
-		delete(p.lastReq, key)
-		evicted++
+	for k := range p.h2 {
+		if k.PID == pid {
+			delete(p.h2, k)
+			evicted++
+		}
 	}
-	if _, ok := p.h2[key]; ok {
-		delete(p.h2, key)
-		evicted++
+	for k := range p.proto {
+		if k.PID == pid {
+			delete(p.proto, k)
+			evicted++
+		}
 	}
-	if _, ok := p.proto[key]; ok {
-		delete(p.proto, key)
+	for k := range p.sseEmittedBytes {
+		if k.PID == pid {
+			delete(p.sseEmittedBytes, k)
+			evicted++
+		}
+	}
+	if _, ok := p.mcpPending[pid]; ok {
+		delete(p.mcpPending, pid)
 		evicted++
 	}
 	if evicted > 0 {
@@ -124,6 +175,8 @@ func newParser(hostname string, configPeers map[string]string) *parser {
 		readBuf:      make(map[connKey][]byte),
 		reqTime:      make(map[connKey]time.Time),
 		lastReq:      make(map[connKey]*http.Request),
+		sseEmittedBytes: make(map[connKey]int),
+		mcpPending:   make(map[uint32]map[float64]*pendingMCPPost),
 		h2:           make(map[connKey]*h2Conn),
 		proto:        make(map[connKey]byte),
 		hostname:     hostname,
@@ -136,7 +189,7 @@ func newParser(hostname string, configPeers map[string]string) *parser {
 func (p *parser) feed(raw RawEvent) *AgentEvent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := connKey{Host: p.hostname, PID: raw.PID}
+	key := connKey{Host: p.hostname, PID: raw.PID, SSL: raw.SSL}
 
 	// Protocol detection on first meaningful write. HTTP/2 connection always
 	// starts with the 24-byte preface.
@@ -174,6 +227,22 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		if err != nil {
 			return nil
 		}
+
+		// MCP-over-SSE pairing: a POST /messages/ carries a JSON-RPC
+		// request whose response is pushed on the paired GET /sse stream
+		// (a different SSL connection, same PID). Buffer the POST by
+		// its jsonrpc id, emit when the SSE-side response arrives.
+		if bufferedBody, id, method, args, isRPC := p.tryBufferMCPPost(key, req); isRPC {
+			_ = bufferedBody
+			_ = id
+			_ = method
+			_ = args
+			p.writeBuf[key] = nil
+			p.readBuf[key] = nil
+			p.lastReq[key] = nil
+			return nil
+		}
+
 		p.lastReq[key] = req
 		p.reqTime[key] = time.Now()
 		p.writeBuf[key] = nil
@@ -186,6 +255,13 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		}
 		p.readBuf[key] = append(p.readBuf[key], raw.Data...)
 		p.readBuf[key] = trimToHTTPResponse(p.readBuf[key])
+
+		// SSE streaming: emit each pushed frame as its own event instead
+		// of waiting for stream close (which may never come for MCP).
+		if p.maybeEmitSSEFrames(key, req) {
+			return nil
+		}
+
 		if !responseComplete(p.readBuf[key]) {
 			return nil
 		}
@@ -198,9 +274,256 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		event := p.buildEvent(key, req, res)
 		p.readBuf[key] = nil
 		p.lastReq[key] = nil
+		delete(p.sseEmittedBytes, key)
 		return event
 	}
 	return nil
+}
+
+// tryBufferMCPPost inspects a newly-parsed request. If it is a POST
+// /messages/ carrying an MCP JSON-RPC request with an `id` (i.e. expects
+// a response pushed via SSE), it is buffered by PID+id for later pairing
+// and (true, ...) is returned. Notifications (method but no id) and
+// non-MCP requests are left to normal flow.
+func (p *parser) tryBufferMCPPost(key connKey, req *http.Request) ([]byte, float64, string, any, bool) {
+	if req.Method != "POST" {
+		return nil, 0, "", nil, false
+	}
+	if !strings.Contains(req.URL.Path, "/messages") {
+		return nil, 0, "", nil, false
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, 0, "", nil, false
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	var j map[string]any
+	if json.Unmarshal(body, &j) != nil {
+		return nil, 0, "", nil, false
+	}
+	if j["jsonrpc"] != "2.0" {
+		return nil, 0, "", nil, false
+	}
+	method, _ := j["method"].(string)
+	if method == "" {
+		return nil, 0, "", nil, false
+	}
+	idV, hasID := j["id"]
+	if !hasID { // notification (no response expected)
+		return nil, 0, "", nil, false
+	}
+	id, ok := idV.(float64)
+	if !ok {
+		return nil, 0, "", nil, false
+	}
+	var args any
+	var toolName string
+	if params, ok := j["params"].(map[string]any); ok {
+		toolName, _ = params["name"].(string)
+		if a, ok := params["arguments"]; ok {
+			args = a
+		} else if toolName == "" {
+			args = params
+		}
+	}
+	if _, ok := p.mcpPending[key.PID]; !ok {
+		p.mcpPending[key.PID] = make(map[float64]*pendingMCPPost)
+	}
+	p.mcpPending[key.PID][id] = &pendingMCPPost{
+		req:       req,
+		method:    method,
+		toolName:  toolName,
+		arguments: args,
+		peer:      req.Host,
+		reqTime:   time.Now(),
+	}
+	return body, id, method, args, true
+}
+
+// maybeEmitSSEFrames processes new bytes in readBuf for an SSE response.
+// When the response is text/event-stream it emits one AgentEvent per
+// complete `data: {...}` frame (pairing MCP JSON-RPC results with their
+// buffered POST request, or emitting standalone events otherwise).
+// Returns true if this read was handled as an SSE stream — caller should
+// NOT fall through to the normal responseComplete path.
+func (p *parser) maybeEmitSSEFrames(key connKey, req *http.Request) bool {
+	// Need headers before we can classify as SSE.
+	headerEnd := bytes.Index(p.readBuf[key], []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return false
+	}
+	head := bytes.ToLower(p.readBuf[key][:headerEnd])
+	if !bytes.Contains(head, []byte("content-type: text/event-stream")) {
+		return false
+	}
+
+	bodyStart := headerEnd + 4
+	// Decode chunked transfer encoding (MCP FastMCP uses it by default).
+	body := p.readBuf[key][bodyStart:]
+	if bytes.Contains(head, []byte("\r\ntransfer-encoding: chunked")) {
+		body = unchunk(body)
+	}
+
+	// Normalize CRLF → LF so frame boundary detection only has to look for
+	// "\n\n". SSE streams on the wire use CRLF; this is robust either way.
+	body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+
+	// Process frames past the last emitted offset. Frames terminate on
+	// double-newline. Keep already-emitted frames' byte positions via
+	// sseEmittedBytes.
+	already := p.sseEmittedBytes[key]
+	if already > len(body) {
+		already = 0 // buffer was trimmed
+	}
+	remainder := body[already:]
+	const sep = "\n\n"
+	var consumedLen int
+	for {
+		idx := bytes.Index(remainder[consumedLen:], []byte(sep))
+		if idx < 0 {
+			break
+		}
+		frame := remainder[consumedLen : consumedLen+idx]
+		p.emitSSEFrame(key, req, frame)
+		consumedLen += idx + len(sep)
+	}
+	p.sseEmittedBytes[key] = already + consumedLen
+	return true
+}
+
+// emitSSEFrame turns one SSE frame into an AgentEvent. Frame shape:
+//	event: message
+//	data: {"jsonrpc":"2.0","id":0,"result":{...}}
+// or any subset. MCP JSON-RPC responses are paired with their buffered POST.
+func (p *parser) emitSSEFrame(key connKey, req *http.Request, frame []byte) {
+	if p.emit == nil {
+		return
+	}
+	var dataPayload []byte
+	for _, raw := range bytes.Split(frame, []byte("\n")) {
+		line := bytes.TrimRight(raw, "\r")
+		if bytes.HasPrefix(line, []byte("data:")) {
+			dataPayload = bytes.TrimSpace(line[len("data:"):])
+			break
+		}
+	}
+	if len(dataPayload) == 0 {
+		return
+	}
+	var j map[string]any
+	if err := json.Unmarshal(dataPayload, &j); err != nil {
+		return
+	}
+
+	// MCP JSON-RPC response: pair with pending POST by id.
+	if j["jsonrpc"] == "2.0" {
+		if id, ok := j["id"].(float64); ok {
+			if pending, ok := p.mcpPending[key.PID][id]; ok {
+				p.emit(p.buildMCPPairedEvent(key, pending, j))
+				delete(p.mcpPending[key.PID], id)
+				return
+			}
+			// Unpaired (e.g., daemon started mid-session) — emit alone.
+			p.emit(p.buildMCPStandaloneEvent(key, req, j))
+			return
+		}
+	}
+	// Non-RPC SSE frame (LLM streaming chunk, MCP endpoint announcement) —
+	// fall through to normal stream-close summarization path. Nothing to emit
+	// per-frame; the terminal buildEvent() still runs on stream close.
+}
+
+func (p *parser) buildMCPPairedEvent(key connKey, pending *pendingMCPPost, resObj map[string]any) *AgentEvent {
+	// Register the peer as MCP so subsequent calls that bypass the SSE
+	// pairing path (notifications, non-id requests) classify correctly.
+	registerEndpoint(p.mcpEndpoints, pending.peer, maxMCPEndpoints, "MCP")
+	latency := time.Since(pending.reqTime).Seconds() * 1000
+	reqBodyMap := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  pending.method,
+	}
+	// Rebuild a `params` map when we have meaningful data. Keeping the
+	// printer's contract {"name", "arguments"} makes `tools/call add({...})`
+	// render consistently; other methods can use a bare arguments blob.
+	if pending.toolName != "" || pending.arguments != nil {
+		params := map[string]any{}
+		if pending.toolName != "" {
+			params["name"] = pending.toolName
+		}
+		if pending.arguments != nil {
+			params["arguments"] = pending.arguments
+		}
+		reqBodyMap["params"] = params
+	}
+	reqJSON, _ := json.Marshal(map[string]any{
+		"method": "POST", "path": pending.req.URL.Path, "body": reqBodyMap,
+	})
+	resJSON, _ := json.Marshal(map[string]any{
+		"status": 200, "body": resObj,
+	})
+	return &AgentEvent{
+		Host:      key.Host, PID: key.PID,
+		Timestamp: float64(time.Now().UnixMilli()) / 1000,
+		Direction: "send",
+		CommType:  "Agent↔MCP",
+		Peer:      pending.peer,
+		Request:   string(reqJSON),
+		Response:  string(resJSON),
+		LatencyMs: latency,
+	}
+}
+
+func (p *parser) buildMCPStandaloneEvent(key connKey, req *http.Request, resObj map[string]any) *AgentEvent {
+	reqJSON, _ := json.Marshal(map[string]any{
+		"method": req.Method, "path": req.URL.Path, "body": nil,
+	})
+	resJSON, _ := json.Marshal(map[string]any{
+		"status": 200, "body": resObj,
+	})
+	return &AgentEvent{
+		Host:      key.Host, PID: key.PID,
+		Timestamp: float64(time.Now().UnixMilli()) / 1000,
+		Direction: "send",
+		CommType:  "Agent↔MCP",
+		Peer:      req.Host,
+		Request:   string(reqJSON),
+		Response:  string(resJSON),
+		LatencyMs: 0,
+	}
+}
+
+// unchunk strips HTTP/1.1 chunked-transfer framing from a body. Returns
+// the original bytes if framing is malformed (best-effort).
+func unchunk(b []byte) []byte {
+	var out []byte
+	for len(b) > 0 {
+		crlf := bytes.Index(b, []byte("\r\n"))
+		if crlf < 0 {
+			break
+		}
+		sizeStr := string(b[:crlf])
+		if semi := strings.IndexByte(sizeStr, ';'); semi >= 0 {
+			sizeStr = sizeStr[:semi]
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeStr), 16, 64)
+		if err != nil {
+			return b
+		}
+		b = b[crlf+2:]
+		if size == 0 {
+			break
+		}
+		if int(size) > len(b) {
+			out = append(out, b...)
+			break
+		}
+		out = append(out, b[:size]...)
+		b = b[size:]
+		if len(b) >= 2 && b[0] == '\r' && b[1] == '\n' {
+			b = b[2:]
+		}
+	}
+	return out
 }
 
 var httpMethods = []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT "}
@@ -534,20 +857,29 @@ func hasMCPMethod(body []byte) bool {
 		strings.HasPrefix(m, "prompts/")
 }
 
-// isA2AProtocol detects Google Agent-to-Agent protocol traffic.
+// isA2AProtocol detects Google Agent-to-Agent protocol traffic. Covers
+// both the legacy and current (a2a-sdk ≥ 0.3) method/path conventions.
 func isA2AProtocol(reqBody []byte, method, path string) bool {
-	// Agent Card discovery: GET /.well-known/agent.json
+	// Agent Card discovery — both spellings used in the wild.
 	cleanPath := path
 	if i := strings.IndexByte(cleanPath, '?'); i >= 0 {
 		cleanPath = cleanPath[:i]
 	}
-	if method == "GET" && strings.HasSuffix(cleanPath, "/.well-known/agent.json") {
-		return true
+	if method == "GET" {
+		if strings.HasSuffix(cleanPath, "/.well-known/agent.json") ||
+			strings.HasSuffix(cleanPath, "/.well-known/agent-card.json") {
+			return true
+		}
 	}
-	// JSON-RPC 2.0 tasks/* methods.
+	// JSON-RPC 2.0 A2A methods — current SDK uses `message/send`,
+	// `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/pushNotificationConfig/*`,
+	// `tasks/resubscribe`. Legacy spec used `tasks/send`.
 	var j map[string]any
 	if json.Unmarshal(reqBody, &j) == nil && j["jsonrpc"] == "2.0" {
-		if m, _ := j["method"].(string); strings.HasPrefix(m, "tasks/") {
+		m, _ := j["method"].(string)
+		if strings.HasPrefix(m, "tasks/") ||
+			strings.HasPrefix(m, "message/") ||
+			m == "agent/getAuthenticatedExtendedCard" {
 			return true
 		}
 	}

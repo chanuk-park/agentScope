@@ -99,6 +99,12 @@ func (p *printer) print(e *Event) {
 
 	method, _ := req["method"].(string)
 	path, _ := req["path"].(string)
+	// A2A card discovery: GET /.well-known/agent-card.json → no body, but
+	// the URL itself carries the semantic intent. Surface it as the req.
+	if method == "GET" && (strings.HasSuffix(path, "/.well-known/agent-card.json") ||
+		strings.HasSuffix(path, "/.well-known/agent.json")) {
+		req["body"] = "discover peer agent card"
+	}
 	status := 0
 	if v, ok := res["status"].(float64); ok {
 		status = int(v)
@@ -129,8 +135,6 @@ func (p *printer) print(e *Event) {
 		fmt.Fprintf(&buf, "  %sreq%s%s\n", gray, reset, renderReq(reqBody))
 		fmt.Fprintf(&buf, "  %sres%s%s\n", gray, reset, renderRes(resBody))
 	}
-	buf.WriteString(strings.Repeat("─", 90))
-	buf.WriteByte('\n')
 
 	// Single Write under a mutex: even if stdout is buffered/line-buffered,
 	// we guarantee no other goroutine can interleave between header and
@@ -225,17 +229,20 @@ func renderRes(body any) string {
 	if errObj, ok := m["error"].(map[string]any); ok {
 		return "  " + red + formatProviderError(errObj) + reset
 	}
-	// LLM tool call.
-	if tc := extractToolCall(m); tc != "" {
-		return "  " + cyan + tc + reset
-	}
-	// LLM assistant text.
+	// LLM assistant text. Checked BEFORE tool_calls because some weak
+	// open-source models emit both a text answer and a spurious
+	// tool_call on the same response (non-compliant with OpenAI spec);
+	// in that case the content is what the caller actually uses.
 	if text := extractLLMText(m); text != "" {
 		suffix := ""
 		if fr := extractFinishReason(m); fr != "" {
 			suffix = fmt.Sprintf("  %s(%s)%s", gray, fr, reset)
 		}
 		return "  " + fmt.Sprintf("%q", truncate(text, 200)) + suffix
+	}
+	// LLM tool call.
+	if tc := extractToolCall(m); tc != "" {
+		return "  " + cyan + tc + reset
 	}
 	// JSON-RPC result summary.
 	if res, ok := m["result"]; ok {
@@ -259,27 +266,61 @@ func extractLLMPrompt(m map[string]any) string {
 			}
 		}
 	}
-	// OpenAI / Anthropic / Ollama: messages[-1].content
+	// OpenAI / Anthropic / Ollama: messages[*]
+	// In a ReAct loop the list grows each turn as [system?, user,
+	// ai(tool_call), tool, ai(tool_call), tool, ...]. Showing only the
+	// last item yields confusing "prompts" that are actually tool
+	// responses. Instead surface the ORIGINAL user instruction (the
+	// first user-role message), then annotate how many tool/assistant
+	// roundtrips have happened since.
 	if msgs, ok := m["messages"].([]any); ok && len(msgs) > 0 {
-		if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
-			switch c := last["content"].(type) {
-			case string:
-				return c
-			case []any:
-				// OpenAI multimodal: concat text blocks
-				for _, b := range c {
-					if bm, ok := b.(map[string]any); ok {
-						if t, _ := bm["text"].(string); t != "" {
-							return t
-						}
-					}
-				}
+		firstUser := ""
+		toolTurns := 0
+		for _, mm := range msgs {
+			msg, _ := mm.(map[string]any)
+			if msg == nil {
+				continue
 			}
+			role, _ := msg["role"].(string)
+			if role == "user" && firstUser == "" {
+				firstUser = extractMessageText(msg)
+			}
+			if role == "tool" {
+				toolTurns++
+			}
+		}
+		if firstUser != "" {
+			if toolTurns > 0 {
+				return firstUser + fmt.Sprintf("  [+%d tool turns]", toolTurns)
+			}
+			return firstUser
+		}
+		// Fallback: last message text (legacy behaviour).
+		if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
+			return extractMessageText(last)
 		}
 	}
 	// Ollama completion endpoint
 	if p, _ := m["prompt"].(string); p != "" {
 		return p
+	}
+	return ""
+}
+
+// extractMessageText pulls the text payload from one OpenAI / Anthropic
+// message regardless of whether content is a string or an array of blocks.
+func extractMessageText(msg map[string]any) string {
+	switch c := msg["content"].(type) {
+	case string:
+		return c
+	case []any:
+		for _, b := range c {
+			if bm, ok := b.(map[string]any); ok {
+				if t, _ := bm["text"].(string); t != "" {
+					return t
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -551,20 +592,69 @@ func jsonRPCReqExtra(m map[string]any) string {
 	if params == nil {
 		return ""
 	}
-	// Common single-key summaries (id, name).
-	if id, _ := params["id"].(string); id != "" {
-		return "#" + id
-	}
+	// MCP tools/call: show tool name + arguments
 	if n, _ := params["name"].(string); n != "" {
+		if args, ok := params["arguments"]; ok {
+			return n + "(" + compactAny(args, 120) + ")"
+		}
 		return n
 	}
+	// A2A message/send / tasks/send: message.parts[*].text (text may be
+	// nested under a "root" wrapper when the SDK serializes discriminated
+	// unions — handle both shapes).
+	if msg, ok := params["message"].(map[string]any); ok {
+		if parts, ok := msg["parts"].([]any); ok && len(parts) > 0 {
+			for _, p := range parts {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := pm["text"].(string); t != "" {
+					return fmt.Sprintf("%q", truncate(t, 160))
+				}
+				if root, ok := pm["root"].(map[string]any); ok {
+					if t, _ := root["text"].(string); t != "" {
+						return fmt.Sprintf("%q", truncate(t, 160))
+					}
+				}
+			}
+		}
+	}
+	if id, _ := params["id"].(string); id != "" {
+		return "#" + shortID(id)
+	}
 	return ""
+}
+
+// shortID abbreviates long UUIDs for readability.
+func shortID(s string) string {
+	if len(s) > 12 {
+		return s[:8]
+	}
+	return s
 }
 
 func summarizeJSONRPCResult(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return compactAny(v, 120)
+	}
+	// MCP tools/call result → content[*].text
+	if content, ok := m["content"].([]any); ok && len(content) > 0 {
+		var b strings.Builder
+		for _, c := range content {
+			if cm, ok := c.(map[string]any); ok {
+				if t, _ := cm["text"].(string); t != "" {
+					if b.Len() > 0 {
+						b.WriteString(" ")
+					}
+					b.WriteString(t)
+				}
+			}
+		}
+		if b.Len() > 0 {
+			return fmt.Sprintf("%q", truncate(b.String(), 160))
+		}
 	}
 	// MCP tools/list
 	if tools, ok := m["tools"].([]any); ok {
@@ -578,7 +668,45 @@ func summarizeJSONRPCResult(v any) string {
 	if pv, _ := m["protocolVersion"].(string); pv != "" {
 		return "protocolVersion " + pv
 	}
-	// A2A status
+	// A2A Message result (a2a-sdk ≥ 0.3): {"kind":"message","parts":[{"kind":"text","text":"..."}]}
+	if kind, _ := m["kind"].(string); kind == "message" {
+		if parts, ok := m["parts"].([]any); ok && len(parts) > 0 {
+			var b strings.Builder
+			for _, p := range parts {
+				if pm, ok := p.(map[string]any); ok {
+					if t, _ := pm["text"].(string); t != "" {
+						if b.Len() > 0 {
+							b.WriteString(" ")
+						}
+						b.WriteString(t)
+					}
+				}
+			}
+			if b.Len() > 0 {
+				return fmt.Sprintf("%q", truncate(b.String(), 160))
+			}
+		}
+	}
+	// A2A legacy Task result with artifacts[0].parts[0].text
+	if artifacts, ok := m["artifacts"].([]any); ok && len(artifacts) > 0 {
+		if a0, ok := artifacts[0].(map[string]any); ok {
+			if parts, ok := a0["parts"].([]any); ok && len(parts) > 0 {
+				for _, p := range parts {
+					if pm, ok := p.(map[string]any); ok {
+						if t, _ := pm["text"].(string); t != "" {
+							if st, ok := m["status"].(map[string]any); ok {
+								if s, _ := st["state"].(string); s != "" {
+									return fmt.Sprintf("%q [state: %s]", truncate(t, 120), s)
+								}
+							}
+							return fmt.Sprintf("%q", truncate(t, 160))
+						}
+					}
+				}
+			}
+		}
+	}
+	// A2A status only
 	if st, ok := m["status"].(map[string]any); ok {
 		if s, _ := st["state"].(string); s != "" {
 			return "state: " + s

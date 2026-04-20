@@ -19,11 +19,12 @@ type RawEvent struct {
 	PID         uint32
 	TID         uint32
 	TimestampNs uint64
+	SSL         uint64
 	Type        uint8
 	Data        []byte
 }
 
-func Run(masterAddr, hostOverride string, configPeers map[string]string, stop chan os.Signal) {
+func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]string, stop chan os.Signal) {
 	objs := SslTraceObjects{}
 	if err := LoadSslTraceObjects(&objs, nil); err != nil {
 		log.Fatalf("load bpf: %v", err)
@@ -87,12 +88,17 @@ func Run(masterAddr, hostOverride string, configPeers map[string]string, stop ch
 	}
 	parser := newParser(hostname, configPeers)
 	sender := newSender(masterAddr, hostname)
+	parser.emit = sender.enqueue
 	go sender.run()
 
 	scannerStop := make(chan struct{})
-	scanner := newPIDScanner(objs.AgentPids, parser, 200*time.Millisecond)
+	scanner := newPIDScanner(objs.AgentPids, parser, 200*time.Millisecond, cmdlineFilter)
 	go scanner.run(scannerStop)
-	log.Printf("agent filter active (scanning /proc every 200ms)")
+	if cmdlineFilter != "" {
+		log.Printf("agent filter active (scanning /proc every 200ms, cmdline must contain %q)", cmdlineFilter)
+	} else {
+		log.Printf("agent filter active (scanning /proc every 200ms)")
+	}
 
 	go func() { <-stop; close(scannerStop); rd.Close() }()
 
@@ -113,19 +119,20 @@ func Run(masterAddr, hostOverride string, configPeers map[string]string, stop ch
 }
 
 func parseRawEvent(b []byte) RawEvent {
-	// ssl_event layout: pid(4) tid(4) ts(8) type(1) pad(3) data_len(4) data(N)
+	// ssl_event layout: pid(4) tid(4) ts(8) ssl(8) type(1) pad(3) data_len(4) data(N)
 	e := RawEvent{
 		PID:         binary.LittleEndian.Uint32(b[0:4]),
 		TID:         binary.LittleEndian.Uint32(b[4:8]),
 		TimestampNs: binary.LittleEndian.Uint64(b[8:16]),
-		Type:        b[16],
+		SSL:         binary.LittleEndian.Uint64(b[16:24]),
+		Type:        b[24],
 	}
-	dataLen := binary.LittleEndian.Uint32(b[20:24])
-	if int(dataLen) > len(b)-24 {
-		dataLen = uint32(len(b) - 24)
+	dataLen := binary.LittleEndian.Uint32(b[28:32])
+	if int(dataLen) > len(b)-32 {
+		dataLen = uint32(len(b) - 32)
 	}
 	e.Data = make([]byte, dataLen)
-	copy(e.Data, b[24:24+dataLen])
+	copy(e.Data, b[32:32+dataLen])
 	return e
 }
 

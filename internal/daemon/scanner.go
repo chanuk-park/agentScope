@@ -45,14 +45,25 @@ var agentCmdlineMarkers = [][]byte{
 }
 
 type pidScanner struct {
-	m        *ebpf.Map
-	p        *parser // parser receives eviction for dead PIDs
-	interval time.Duration
-	tracked  map[uint32]struct{}
+	m              *ebpf.Map
+	p              *parser // parser receives eviction for dead PIDs
+	interval       time.Duration
+	tracked        map[uint32]struct{}
+	cmdlineFilter  []byte // optional extra restriction; only PIDs whose cmdline contains this substring are tracked
 }
 
-func newPIDScanner(m *ebpf.Map, p *parser, interval time.Duration) *pidScanner {
-	return &pidScanner{m: m, p: p, interval: interval, tracked: map[uint32]struct{}{}}
+func newPIDScanner(m *ebpf.Map, p *parser, interval time.Duration, cmdlineFilter string) *pidScanner {
+	var filter []byte
+	if cmdlineFilter != "" {
+		filter = []byte(cmdlineFilter)
+	}
+	return &pidScanner{
+		m:             m,
+		p:             p,
+		interval:      interval,
+		tracked:       map[uint32]struct{}{},
+		cmdlineFilter: filter,
+	}
 }
 
 func (s *pidScanner) run(stop <-chan struct{}) {
@@ -71,7 +82,7 @@ func (s *pidScanner) run(stop <-chan struct{}) {
 }
 
 func (s *pidScanner) sync() {
-	current := scanAgents()
+	current := s.scanAgents()
 	added, removed := 0, 0
 	for pid := range current {
 		if _, ok := s.tracked[pid]; ok {
@@ -100,7 +111,7 @@ func (s *pidScanner) sync() {
 	}
 }
 
-func scanAgents() map[uint32]struct{} {
+func (s *pidScanner) scanAgents() map[uint32]struct{} {
 	out := map[uint32]struct{}{}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -112,9 +123,21 @@ func scanAgents() map[uint32]struct{} {
 			continue
 		}
 		pid := uint32(n)
-		if isAgentProcess(pid) {
-			out[pid] = struct{}{}
+		if !isAgentProcess(pid) {
+			continue
 		}
+		// Optional per-daemon isolation: only consider agents whose
+		// /proc/<pid>/cmdline contains the operator-provided substring.
+		// Lets 2 daemons on 1 host demo multi-host cleanly by tagging
+		// each fleet with a unique cmdline marker.
+		if len(s.cmdlineFilter) > 0 {
+			cmdline, err := os.ReadFile(filepath.Join("/proc",
+				strconv.FormatUint(uint64(pid), 10), "cmdline"))
+			if err != nil || !bytes.Contains(cmdline, s.cmdlineFilter) {
+				continue
+			}
+		}
+		out[pid] = struct{}{}
 	}
 	return out
 }

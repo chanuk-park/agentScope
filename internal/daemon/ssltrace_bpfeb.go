@@ -16,12 +16,14 @@ type SslTraceExArg struct {
 	Buf     uint64
 	Num     uint64
 	Written uint64
+	Ssl     uint64
 }
 
 type SslTraceWriteArg struct {
 	Buf uint64
 	Len uint32
 	_   [4]byte
+	Ssl uint64
 }
 
 // LoadSslTrace returns the embedded CollectionSpec for SslTrace.
