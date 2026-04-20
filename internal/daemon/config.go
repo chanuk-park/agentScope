@@ -25,9 +25,18 @@ var validCommTypes = map[string]struct{}{
 //     "ollama.local:11434": "Agent↔Model"
 //     "my-mcp-server:3000": "Agent↔MCP"
 //
-// Keys may be full `host:port` or bare `host` (the classifier checks both).
+//   llm_hostnames: ["api.openai.com", "api.anthropic.com"]
+//   llm_hostname_patterns: ["*.openai.azure.com", "bedrock-runtime.*.amazonaws.com"]
+//   llm_http_paths: ["POST /v1/chat/completions", "POST /api/generate"]
+//
+// Peers map keys may be full `host:port` or bare `host` (the classifier
+// checks both). LLM lists are merged on top of the built-in defaults from
+// detector.go — operators add to, never replace, the baked-in list.
 type Config struct {
-	Peers map[string]string `yaml:"peers"`
+	Peers               map[string]string `yaml:"peers"`
+	LLMHostnames        []string          `yaml:"llm_hostnames"`
+	LLMHostnamePatterns []string          `yaml:"llm_hostname_patterns"`
+	LLMHTTPPaths        []string          `yaml:"llm_http_paths"`
 }
 
 // LoadConfigFile reads a YAML config from path. If the file does not exist,

@@ -29,9 +29,10 @@ type AgentEvent struct {
 }
 
 type connKey struct {
-	Host string
-	PID  uint32
-	SSL  uint64 // SSL* pointer — distinguishes concurrent TLS conns on same PID
+	Host   string
+	PID    uint32
+	Conn   uint64 // SSL* (TLS) or struct sock* (PLAIN) — separates concurrent conns
+	Source uint8  // mirrors RawEvent.Source: TLS and PLAIN flows live in disjoint buckets
 }
 
 var llmHosts = map[string]bool{
@@ -189,11 +190,11 @@ func newParser(hostname string, configPeers map[string]string) *parser {
 func (p *parser) feed(raw RawEvent) *AgentEvent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := connKey{Host: p.hostname, PID: raw.PID, SSL: raw.SSL}
+	key := connKey{Host: p.hostname, PID: raw.PID, Conn: raw.Conn, Source: raw.Source}
 
 	// Protocol detection on first meaningful write. HTTP/2 connection always
 	// starts with the 24-byte preface.
-	if p.proto[key] == 0 && raw.Type == 0 {
+	if p.proto[key] == 0 && raw.Dir == 0 {
 		if looksLikeH2Preface(raw.Data) {
 			p.proto[key] = 2
 			p.h2[key] = newH2Conn(p.configPeers, p.llmEndpoints, p.mcpEndpoints)
@@ -207,7 +208,7 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		if c == nil {
 			return nil
 		}
-		return c.feed(raw.Type == 0, raw.Data, "", p.hostname, raw.PID)
+		return c.feed(raw.Dir == 0, raw.Data, "", p.hostname, raw.PID)
 	}
 
 	// Skip events whose payload is clearly not HTTP plaintext (TLS handshake
@@ -216,8 +217,8 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		return nil
 	}
 
-	switch raw.Type {
-	case 0: // SSL_WRITE → send
+	switch raw.Dir {
+	case 0: // DIR_WRITE → send
 		p.writeBuf[key] = append(p.writeBuf[key], raw.Data...)
 		p.writeBuf[key] = trimToHTTPRequest(p.writeBuf[key])
 		if !requestComplete(p.writeBuf[key]) {
@@ -248,7 +249,7 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		p.writeBuf[key] = nil
 		p.readBuf[key] = nil // 새 요청 시작 시 이전 read 버퍼 초기화
 
-	case 1: // SSL_READ → recv 완성
+	case 1: // DIR_READ → recv 완성
 		req := p.lastReq[key]
 		if req == nil {
 			return nil // TLS 핸드셰이크 등 요청 전 read는 무시
@@ -256,11 +257,13 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		p.readBuf[key] = append(p.readBuf[key], raw.Data...)
 		p.readBuf[key] = trimToHTTPResponse(p.readBuf[key])
 
-		// SSE streaming: emit each pushed frame as its own event instead
-		// of waiting for stream close (which may never come for MCP).
-		if p.maybeEmitSSEFrames(key, req) {
-			return nil
-		}
+		// SSE streaming: emit each pushed frame as its own MCP event
+		// (side effect inside maybeEmitSSEFrames) — but still fall through
+		// to the normal completion path. MCP streams stay open forever and
+		// never reach responseComplete=true; LLM streams terminate with
+		// `data: [DONE]` so responseComplete fires and buildEvent merges
+		// the per-chunk text into the final summary.
+		p.maybeEmitSSEFrames(key, req)
 
 		if !responseComplete(p.readBuf[key]) {
 			return nil

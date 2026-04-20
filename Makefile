@@ -26,5 +26,7 @@ build:
 	$(GOEXE) build -o agentscoped ./
 
 clean:
-	rm -f agentscoped bpf/vmlinux.h internal/daemon/ssl_trace_bpfel.go internal/daemon/ssl_trace_bpfeb.go internal/daemon/ssl_trace_bpfel.o internal/daemon/ssl_trace_bpfeb.o
+	rm -f agentscoped bpf/vmlinux.h \
+	      internal/daemon/capture_bpfel.go internal/daemon/capture_bpfeb.go \
+	      internal/daemon/capture_bpfel.o  internal/daemon/capture_bpfeb.o
 	rm -rf gen/

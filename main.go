@@ -1,4 +1,4 @@
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -output-dir internal/daemon SslTrace bpf/ssl_trace.bpf.c -- -I/usr/include/x86_64-linux-gnu -I/usr/include -D__TARGET_ARCH_x86
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -output-dir internal/daemon Capture bpf/capture.bpf.c -- -I/usr/include/x86_64-linux-gnu -I/usr/include -D__TARGET_ARCH_x86
 
 package main
 
@@ -37,7 +37,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("config: %v", err)
 		}
-		daemon.Run(*masterAddr, *host, *cmdlineFilter, overrides, sig)
+		rules, err := daemon.LoadDetectorRules(*configPath)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		daemon.Run(*masterAddr, *host, *cmdlineFilter, overrides, rules, sig)
 	case "master":
 		master.Run(*listen, *verbose, sig)
 	default:
