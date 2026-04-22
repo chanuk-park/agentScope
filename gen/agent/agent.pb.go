@@ -30,8 +30,8 @@ type AgentEvent struct {
 	CommType      string                 `protobuf:"bytes,5,opt,name=comm_type,json=commType,proto3" json:"comm_type,omitempty"`          // Agent↔Model | Agent↔Agent | Agent↔MCP
 	ContentType   string                 `protobuf:"bytes,6,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"` // TEXT | FILE_READ | FILE | IMAGE
 	Peer          string                 `protobuf:"bytes,7,opt,name=peer,proto3" json:"peer,omitempty"`
-	Request       string                 `protobuf:"bytes,8,opt,name=request,proto3" json:"request,omitempty"`   // JSON string
-	Response      string                 `protobuf:"bytes,9,opt,name=response,proto3" json:"response,omitempty"` // JSON string
+	Request       []byte                 `protobuf:"bytes,8,opt,name=request,proto3" json:"request,omitempty"` // JSON bytes (skip UTF-8 validation, zero-copy on the wire)
+	Response      []byte                 `protobuf:"bytes,9,opt,name=response,proto3" json:"response,omitempty"`
 	LatencyMs     float64                `protobuf:"fixed64,10,opt,name=latency_ms,json=latencyMs,proto3" json:"latency_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -116,18 +116,18 @@ func (x *AgentEvent) GetPeer() string {
 	return ""
 }
 
-func (x *AgentEvent) GetRequest() string {
+func (x *AgentEvent) GetRequest() []byte {
 	if x != nil {
 		return x.Request
 	}
-	return ""
+	return nil
 }
 
-func (x *AgentEvent) GetResponse() string {
+func (x *AgentEvent) GetResponse() []byte {
 	if x != nil {
 		return x.Response
 	}
-	return ""
+	return nil
 }
 
 func (x *AgentEvent) GetLatencyMs() float64 {
@@ -187,8 +187,8 @@ const file_agent_proto_rawDesc = "" +
 	"\tcomm_type\x18\x05 \x01(\tR\bcommType\x12!\n" +
 	"\fcontent_type\x18\x06 \x01(\tR\vcontentType\x12\x12\n" +
 	"\x04peer\x18\a \x01(\tR\x04peer\x12\x18\n" +
-	"\arequest\x18\b \x01(\tR\arequest\x12\x1a\n" +
-	"\bresponse\x18\t \x01(\tR\bresponse\x12\x1d\n" +
+	"\arequest\x18\b \x01(\fR\arequest\x12\x1a\n" +
+	"\bresponse\x18\t \x01(\fR\bresponse\x12\x1d\n" +
 	"\n" +
 	"latency_ms\x18\n" +
 	" \x01(\x01R\tlatencyMs\"\x05\n" +

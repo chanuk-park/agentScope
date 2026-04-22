@@ -14,8 +14,8 @@ message AgentEvent {
     string comm_type    = 5;  // Agent↔Model | Agent↔Agent | Agent↔MCP
     string content_type = 6;  // TEXT | FILE_READ | FILE | IMAGE
     string peer         = 7;
-    string request      = 8;  // JSON string
-    string response     = 9;  // JSON string
+    bytes  request      = 8;  // JSON bytes (skip UTF-8 validation, zero-copy on the wire)
+    bytes  response     = 9;
     double latency_ms   = 10;
 }
 

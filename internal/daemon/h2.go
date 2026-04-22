@@ -250,17 +250,20 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 	reqBody := s.reqBody.Bytes()
 	resBody := s.resBody.Bytes()
 
-	var resBodyJSON any
+	reqMap, reqEmbed := parseBody(reqBody)
+	var resMap map[string]any
+	var resEmbed any
 	if isSSEResponse(s.resHeaders) {
-		resBodyJSON = decodeSSEBody(resBody)
+		resEmbed = decodeSSEBody(resBody)
+		resMap, _ = resEmbed.(map[string]any)
 	} else {
-		resBodyJSON = tryJSON(resBody)
+		resMap, resEmbed = parseBody(resBody)
 	}
 
 	reqJSON, _ := json.Marshal(map[string]any{
 		"method": method,
 		"path":   path,
-		"body":   tryJSON(reqBody),
+		"body":   reqEmbed,
 	})
 	statusCode := 0
 	if status != "" {
@@ -268,7 +271,7 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 	}
 	resJSON, _ := json.Marshal(map[string]any{
 		"status": statusCode,
-		"body":   resBodyJSON,
+		"body":   resEmbed,
 	})
 
 	latency := float64(0)
@@ -281,11 +284,11 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 		PID:         pid,
 		Timestamp:   float64(time.Now().UnixMilli()) / 1000,
 		Direction:   "send",
-		CommType:    classifyComm(authority, method, path, reqBody, resBody, c.cfgPeers, c.llmReg, c.mcpReg),
-		ContentType: classifyContent(reqBody),
+		CommType:    classifyComm(authority, method, path, reqMap, resMap, resBody, c.cfgPeers, c.llmReg, c.mcpReg),
+		ContentType: classifyContent(reqMap),
 		Peer:        authority,
-		Request:     string(reqJSON),
-		Response:    string(resJSON),
+		Request:     reqJSON,
+		Response:    resJSON,
 		LatencyMs:   latency,
 	}
 	delete(c.streams, streamID)

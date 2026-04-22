@@ -23,8 +23,8 @@ type AgentEvent struct {
 	CommType    string
 	ContentType string
 	Peer        string
-	Request     string
-	Response    string
+	Request     []byte
+	Response    []byte
 	LatencyMs   float64
 }
 
@@ -400,8 +400,8 @@ func (p *parser) buildMCPPairedEvent(key connKey, pending *pendingMCPPost, resOb
 		Direction: "send",
 		CommType:  "Agent↔MCP",
 		Peer:      pending.peer,
-		Request:   string(reqJSON),
-		Response:  string(resJSON),
+		Request:   reqJSON,
+		Response:  resJSON,
 		LatencyMs: latency,
 	}
 }
@@ -419,8 +419,8 @@ func (p *parser) buildMCPStandaloneEvent(key connKey, req *http.Request, resObj 
 		Direction: "send",
 		CommType:  "Agent↔MCP",
 		Peer:      req.Host,
-		Request:   string(reqJSON),
-		Response:  string(resJSON),
+		Request:   reqJSON,
+		Response:  resJSON,
 		LatencyMs: 0,
 	}
 }
@@ -568,21 +568,25 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 	reqBody := decodeBody(readAll(req.Body), req.Header.Get("Content-Encoding"))
 	resBody := decodeBody(readAll(res.Body), res.Header.Get("Content-Encoding"))
 
-	var resBodyJSON any
+	reqMap, reqEmbed := parseBody(reqBody)
+	var resMap map[string]any
+	var resEmbed any
 	if isSSEContentType(res.Header.Get("Content-Type")) {
-		resBodyJSON = decodeSSEBody(resBody)
+		// SSE: must merge per-frame deltas into a single shape — can't pass through raw.
+		resEmbed = decodeSSEBody(resBody)
+		resMap, _ = resEmbed.(map[string]any)
 	} else {
-		resBodyJSON = tryJSON(resBody)
+		resMap, resEmbed = parseBody(resBody)
 	}
 
 	reqJSON, _ := json.Marshal(map[string]any{
 		"method": req.Method,
 		"path":   req.URL.Path,
-		"body":   tryJSON(reqBody),
+		"body":   reqEmbed,
 	})
 	resJSON, _ := json.Marshal(map[string]any{
 		"status": res.StatusCode,
-		"body":   resBodyJSON,
+		"body":   resEmbed,
 	})
 
 	return &AgentEvent{
@@ -590,17 +594,18 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 		PID:         key.PID,
 		Timestamp:   float64(time.Now().UnixMilli()) / 1000,
 		Direction:   "send",
-		CommType:    classifyComm(req.Host, req.Method, req.URL.Path, reqBody, resBody, p.configPeers, p.llmEndpoints, p.mcpEndpoints),
-		ContentType: classifyContent(reqBody),
+		CommType:    classifyComm(req.Host, req.Method, req.URL.Path, reqMap, resMap, resBody, p.configPeers, p.llmEndpoints, p.mcpEndpoints),
+		ContentType: classifyContent(reqMap),
 		Peer:        req.Host,
-		Request:     string(reqJSON),
-		Response:    string(resJSON),
+		Request:     reqJSON,
+		Response:    resJSON,
 		LatencyMs:   latency,
 	}
 }
 
 // classifyComm priority: configPeers → llmHosts → registered endpoints → response shape → MCP → A2A → LangGraph → Unknown.
-func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers map[string]string, llmReg, mcpReg map[string]struct{}) string {
+// reqJSON/resJSON are pre-parsed bodies (nil if body wasn't a JSON object); resBytes only consulted for SSE shape detection.
+func classifyComm(peer, method, path string, reqJSON, resJSON map[string]any, resBytes []byte, cfgPeers map[string]string, llmReg, mcpReg map[string]struct{}) string {
 	host := strings.Split(peer, ":")[0]
 
 	if v, ok := cfgPeers[peer]; ok {
@@ -623,26 +628,26 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 		return "Agent↔MCP"
 	}
 
-	if isLLMResponse(resBody) {
+	if isLLMResponse(resJSON, resBytes) {
 		registerEndpoint(llmReg, peer, maxLLMEndpoints, "LLM")
 		return "Agent↔Model"
 	}
 
-	for _, body := range [][]byte{reqBody, resBody} {
-		if isInitializeHandshake(body) {
+	for _, j := range []map[string]any{reqJSON, resJSON} {
+		if isInitializeHandshake(j) {
 			registerEndpoint(mcpReg, peer, maxMCPEndpoints, "MCP")
 			return "Agent↔MCP"
 		}
 	}
 
-	for _, body := range [][]byte{reqBody, resBody} {
-		if hasMCPMethod(body) {
+	for _, j := range []map[string]any{reqJSON, resJSON} {
+		if hasMCPMethod(j) {
 			registerEndpoint(mcpReg, peer, maxMCPEndpoints, "MCP")
 			return "Agent↔MCP"
 		}
 	}
 
-	if isA2AProtocol(reqBody, method, path) {
+	if isA2AProtocol(reqJSON, method, path) {
 		return "Agent↔Agent"
 	}
 	if isLangGraphProtocol(path) {
@@ -652,37 +657,38 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 	return "Unknown"
 }
 
-// isLLMResponse matches OpenAI/Anthropic/Ollama/Gemini response shape on plain JSON or SSE body.
-func isLLMResponse(body []byte) bool {
-	if matchLLMShape(body) {
+// isLLMResponse: parsed first, then SSE bytes scan as fallback (resBytes only consulted for SSE).
+func isLLMResponse(parsed map[string]any, raw []byte) bool {
+	if matchLLMShape(parsed) {
 		return true
 	}
-	if bytes.Contains(body, []byte("\ndata:")) || bytes.HasPrefix(body, []byte("data:")) {
-		scanned := 0
-		for _, line := range bytes.Split(body, []byte("\n")) {
-			line = bytes.TrimRight(line, "\r")
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
-			}
-			payload := bytes.TrimSpace(line[len("data:"):])
-			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-				continue
-			}
-			if matchLLMShape(payload) {
-				return true
-			}
-			scanned++
-			if scanned >= 4 {
-				break
-			}
+	if !bytes.Contains(raw, []byte("\ndata:")) && !bytes.HasPrefix(raw, []byte("data:")) {
+		return false
+	}
+	scanned := 0
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var j map[string]any
+		if json.Unmarshal(payload, &j) == nil && matchLLMShape(j) {
+			return true
+		}
+		scanned++
+		if scanned >= 4 {
+			break
 		}
 	}
 	return false
 }
 
-func matchLLMShape(body []byte) bool {
-	var j map[string]any
-	if json.Unmarshal(body, &j) != nil {
+func matchLLMShape(j map[string]any) bool {
+	if j == nil {
 		return false
 	}
 	if obj, _ := j["object"].(string); strings.HasPrefix(obj, "chat.completion") || obj == "text_completion" {
@@ -711,16 +717,8 @@ func matchLLMShape(body []byte) bool {
 	return false
 }
 
-// isInitializeHandshake: MCP `initialize` with `params.protocolVersion` is unique to MCP.
-func isInitializeHandshake(body []byte) bool {
-	var j map[string]any
-	if json.Unmarshal(body, &j) != nil {
-		return false
-	}
-	if j["jsonrpc"] != "2.0" {
-		return false
-	}
-	if j["method"] != "initialize" {
+func isInitializeHandshake(j map[string]any) bool {
+	if j == nil || j["jsonrpc"] != "2.0" || j["method"] != "initialize" {
 		return false
 	}
 	params, ok := j["params"].(map[string]any)
@@ -731,10 +729,8 @@ func isInitializeHandshake(body []byte) bool {
 	return has
 }
 
-// hasMCPMethod: tools/* / resources/* / prompts/* JSON-RPC method (mid-session attach fallback).
-func hasMCPMethod(body []byte) bool {
-	var j map[string]any
-	if json.Unmarshal(body, &j) != nil || j["jsonrpc"] != "2.0" {
+func hasMCPMethod(j map[string]any) bool {
+	if j == nil || j["jsonrpc"] != "2.0" {
 		return false
 	}
 	m, _ := j["method"].(string)
@@ -743,7 +739,7 @@ func hasMCPMethod(body []byte) bool {
 		strings.HasPrefix(m, "prompts/")
 }
 
-func isA2AProtocol(reqBody []byte, method, path string) bool {
+func isA2AProtocol(reqJSON map[string]any, method, path string) bool {
 	cleanPath := path
 	if i := strings.IndexByte(cleanPath, '?'); i >= 0 {
 		cleanPath = cleanPath[:i]
@@ -754,9 +750,8 @@ func isA2AProtocol(reqBody []byte, method, path string) bool {
 			return true
 		}
 	}
-	var j map[string]any
-	if json.Unmarshal(reqBody, &j) == nil && j["jsonrpc"] == "2.0" {
-		m, _ := j["method"].(string)
+	if reqJSON != nil && reqJSON["jsonrpc"] == "2.0" {
+		m, _ := reqJSON["method"].(string)
 		if strings.HasPrefix(m, "tasks/") ||
 			strings.HasPrefix(m, "message/") ||
 			m == "agent/getAuthenticatedExtendedCard" {
@@ -794,9 +789,8 @@ func registerEndpoint(reg map[string]struct{}, peer string, max int, label strin
 	log.Printf("parser: %s endpoint registered: %s (total=%d)", label, peer, len(reg))
 }
 
-func classifyContent(body []byte) string {
-	var j map[string]any
-	if json.Unmarshal(body, &j) != nil {
+func classifyContent(j map[string]any) string {
+	if j == nil {
 		return "TEXT"
 	}
 	msgs, _ := j["messages"].([]any)
@@ -871,6 +865,21 @@ func tryJSON(b []byte) any {
 		return v
 	}
 	return string(b)
+}
+
+// parseBody returns the parsed top-level object (nil if body isn't a JSON object)
+// alongside an embeddable representation: json.RawMessage for valid JSON (skips
+// re-marshal), or string fallback. Single Unmarshal call.
+func parseBody(b []byte) (parsed map[string]any, embed any) {
+	if len(b) == 0 {
+		return nil, ""
+	}
+	var v any
+	if json.Unmarshal(b, &v) != nil {
+		return nil, string(b)
+	}
+	m, _ := v.(map[string]any)
+	return m, json.RawMessage(b)
 }
 
 // decodeSSEBody merges per-provider delta fragments into a single text + preserves trailing metadata.

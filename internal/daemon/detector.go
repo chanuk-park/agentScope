@@ -335,12 +335,12 @@ func classifySignal(ev *AgentEvent) string {
 }
 
 // hasToolKeyword: JSON keys are quoted, so a literal substring match suffices.
-func hasToolKeyword(jsonStr string) bool {
-	if jsonStr == "" {
+func hasToolKeyword(b []byte) bool {
+	if len(b) == 0 {
 		return false
 	}
-	for _, k := range []string{`"tools":`, `"functions":`, `"tool_calls":`, `"tool_use"`} {
-		if strings.Contains(jsonStr, k) {
+	for _, k := range [][]byte{[]byte(`"tools":`), []byte(`"functions":`), []byte(`"tool_calls":`), []byte(`"tool_use"`)} {
+		if bytes.Contains(b, k) {
 			return true
 		}
 	}

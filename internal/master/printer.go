@@ -58,8 +58,8 @@ type Event struct {
 	CommType    string
 	ContentType string
 	Peer        string
-	Request     string
-	Response    string
+	Request     []byte
+	Response    []byte
 	LatencyMs   float64
 }
 
@@ -84,9 +84,9 @@ func (p *printer) print(e *Event) {
 	}
 
 	var req map[string]any
-	_ = json.Unmarshal([]byte(e.Request), &req)
+	_ = json.Unmarshal(e.Request, &req)
 	var res map[string]any
-	_ = json.Unmarshal([]byte(e.Response), &res)
+	_ = json.Unmarshal(e.Response, &res)
 
 	method, _ := req["method"].(string)
 	path, _ := req["path"].(string)
