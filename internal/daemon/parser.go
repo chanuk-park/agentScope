@@ -28,11 +28,12 @@ type AgentEvent struct {
 	LatencyMs   float64
 }
 
+// connKey: Source separates TLS and PLAIN pointer spaces so they can't collide.
 type connKey struct {
 	Host   string
 	PID    uint32
-	Conn   uint64 // SSL* (TLS) or struct sock* (PLAIN) — separates concurrent conns
-	Source uint8  // mirrors RawEvent.Source: TLS and PLAIN flows live in disjoint buckets
+	Conn   uint64
+	Source uint8
 }
 
 var llmHosts = map[string]bool{
@@ -50,60 +51,33 @@ type parser struct {
 	reqTime  map[connKey]time.Time
 	lastReq  map[connKey]*http.Request
 	h2       map[connKey]*h2Conn
-	proto    map[connKey]byte // 0 = unknown, 1 = http/1, 2 = http/2
+	proto    map[connKey]byte // 0=unknown, 1=http/1, 2=http/2
 	hostname string
 
-	// sseEmittedBytes[key] tracks how many bytes of the SSE response stream
-	// we've already converted into per-frame events. Required because SSE
-	// streams (MCP `GET /sse`, LLM streaming) can stay open for minutes —
-	// we must emit each pushed `data: {...}` frame as it arrives rather
-	// than wait for stream close.
+	// SSE streams stay open for minutes; track per-key offset so we emit each new frame once.
 	sseEmittedBytes map[connKey]int
 
-	// mcpPending pairs MCP `POST /messages/` JSON-RPC requests (which only
-	// receive a `202 Accepted` body) with their eventual result pushed on
-	// the paired GET /sse stream by the server. Keyed by PID (SSE stream
-	// and POST run on different SSL connections, same process) → jsonrpc
-	// request id → buffered request metadata.
+	// MCP POST /messages/ → SSE pairing keyed by PID + jsonrpc id (request and response on different conns).
 	mcpPending map[uint32]map[float64]*pendingMCPPost
 
-	// emit is called for side-channel events: per-SSE-frame MCP responses,
-	// paired POST/SSE combined events. The primary feed() return value is
-	// used for normal HTTP/1.1 request-response pairs.
+	// emit forwards side-channel events (per-frame MCP pairs) outside the feed() return path.
 	emit func(*AgentEvent)
 
-	// llmEndpoints / mcpEndpoints remember peers (host:port) after a
-	// protocol-specific signature is observed. Once tagged, subsequent
-	// calls to the same peer are classified in O(1) without re-inspecting
-	// the body. Intentionally *not* tied to PID lifecycle: endpoints are
-	// long-lived host/port pairs that outlive any one agent.
-	//
-	// llmEndpoints is populated by response-shape detection (OpenAI-compat,
-	// Anthropic, Ollama, Gemini native). This covers self-hosted LLMs
-	// (vLLM, Ollama, LiteLLM proxy) whose hostnames aren't in llmHosts.
-	//
-	// mcpEndpoints is populated by the MCP `initialize` handshake
-	// (`params.protocolVersion`), or by the MCP method namespace fallback
-	// (tools/*, resources/*, prompts/*) when the daemon joins mid-session.
+	// Endpoints registered after first signature match, then O(1) on subsequent calls. Outlive any single PID.
 	llmEndpoints map[string]struct{}
 	mcpEndpoints map[string]struct{}
 
-	// configPeers is a read-only map of user-declared comm-type overrides
-	// loaded from the YAML config + `-peer` CLI flags. Consulted *before*
-	// any heuristic in classifyComm, so operators can force-tag endpoints
-	// the automatic detection gets wrong or can't yet recognise.
+	// configPeers: user-declared comm-type overrides, consulted before any heuristic.
 	configPeers map[string]string
 }
 
-// pendingMCPPost is a POST /messages/ request buffered while we wait for
-// the server to push its JSON-RPC response on the paired SSE stream.
 type pendingMCPPost struct {
-	req      *http.Request
-	method   string
-	toolName string // only set for tools/call — name of the invoked tool
+	req       *http.Request
+	method    string
+	toolName  string
 	arguments any
-	peer     string
-	reqTime  time.Time
+	peer      string
+	reqTime   time.Time
 }
 
 const (
@@ -111,9 +85,7 @@ const (
 	maxMCPEndpoints = 1024
 )
 
-// evictPID removes every connKey entry tied to pid across all buffer maps.
-// Called by the PID scanner when a tracked agent process exits — otherwise
-// long-running daemons would slowly accumulate dead-PID buffers.
+// evictPID drops every connKey buffer tied to pid. Called when an agent process exits.
 func (p *parser) evictPID(pid uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -172,18 +144,18 @@ func newParser(hostname string, configPeers map[string]string) *parser {
 		configPeers = map[string]string{}
 	}
 	return &parser{
-		writeBuf:     make(map[connKey][]byte),
-		readBuf:      make(map[connKey][]byte),
-		reqTime:      make(map[connKey]time.Time),
-		lastReq:      make(map[connKey]*http.Request),
+		writeBuf:        make(map[connKey][]byte),
+		readBuf:         make(map[connKey][]byte),
+		reqTime:         make(map[connKey]time.Time),
+		lastReq:         make(map[connKey]*http.Request),
 		sseEmittedBytes: make(map[connKey]int),
-		mcpPending:   make(map[uint32]map[float64]*pendingMCPPost),
-		h2:           make(map[connKey]*h2Conn),
-		proto:        make(map[connKey]byte),
-		hostname:     hostname,
-		llmEndpoints: make(map[string]struct{}),
-		mcpEndpoints: make(map[string]struct{}),
-		configPeers:  configPeers,
+		mcpPending:      make(map[uint32]map[float64]*pendingMCPPost),
+		h2:              make(map[connKey]*h2Conn),
+		proto:           make(map[connKey]byte),
+		hostname:        hostname,
+		llmEndpoints:    make(map[string]struct{}),
+		mcpEndpoints:    make(map[string]struct{}),
+		configPeers:     configPeers,
 	}
 }
 
@@ -192,8 +164,6 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 	defer p.mu.Unlock()
 	key := connKey{Host: p.hostname, PID: raw.PID, Conn: raw.Conn, Source: raw.Source}
 
-	// Protocol detection on first meaningful write. HTTP/2 connection always
-	// starts with the 24-byte preface.
 	if p.proto[key] == 0 && raw.Dir == 0 {
 		if looksLikeH2Preface(raw.Data) {
 			p.proto[key] = 2
@@ -211,14 +181,13 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		return c.feed(raw.Dir == 0, raw.Data, "", p.hostname, raw.PID)
 	}
 
-	// Skip events whose payload is clearly not HTTP plaintext (TLS handshake
-	// artifacts, zero-filled reads after TLS session tickets, etc.).
+	// Drop TLS handshake artifacts and zero-filled session-ticket reads.
 	if !looksLikeHTTP(raw.Data) && len(p.writeBuf[key]) == 0 && len(p.readBuf[key]) == 0 {
 		return nil
 	}
 
 	switch raw.Dir {
-	case 0: // DIR_WRITE → send
+	case 0: // DIR_WRITE
 		p.writeBuf[key] = append(p.writeBuf[key], raw.Data...)
 		p.writeBuf[key] = trimToHTTPRequest(p.writeBuf[key])
 		if !requestComplete(p.writeBuf[key]) {
@@ -229,10 +198,6 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 			return nil
 		}
 
-		// MCP-over-SSE pairing: a POST /messages/ carries a JSON-RPC
-		// request whose response is pushed on the paired GET /sse stream
-		// (a different SSL connection, same PID). Buffer the POST by
-		// its jsonrpc id, emit when the SSE-side response arrives.
 		if bufferedBody, id, method, args, isRPC := p.tryBufferMCPPost(key, req); isRPC {
 			_ = bufferedBody
 			_ = id
@@ -247,22 +212,17 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		p.lastReq[key] = req
 		p.reqTime[key] = time.Now()
 		p.writeBuf[key] = nil
-		p.readBuf[key] = nil // 새 요청 시작 시 이전 read 버퍼 초기화
+		p.readBuf[key] = nil
 
-	case 1: // DIR_READ → recv 완성
+	case 1: // DIR_READ
 		req := p.lastReq[key]
 		if req == nil {
-			return nil // TLS 핸드셰이크 등 요청 전 read는 무시
+			return nil
 		}
 		p.readBuf[key] = append(p.readBuf[key], raw.Data...)
 		p.readBuf[key] = trimToHTTPResponse(p.readBuf[key])
 
-		// SSE streaming: emit each pushed frame as its own MCP event
-		// (side effect inside maybeEmitSSEFrames) — but still fall through
-		// to the normal completion path. MCP streams stay open forever and
-		// never reach responseComplete=true; LLM streams terminate with
-		// `data: [DONE]` so responseComplete fires and buildEvent merges
-		// the per-chunk text into the final summary.
+		// MCP streams emit per-frame here; LLM streams fall through to buildEvent at "data: [DONE]".
 		p.maybeEmitSSEFrames(key, req)
 
 		if !responseComplete(p.readBuf[key]) {
@@ -283,11 +243,7 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 	return nil
 }
 
-// tryBufferMCPPost inspects a newly-parsed request. If it is a POST
-// /messages/ carrying an MCP JSON-RPC request with an `id` (i.e. expects
-// a response pushed via SSE), it is buffered by PID+id for later pairing
-// and (true, ...) is returned. Notifications (method but no id) and
-// non-MCP requests are left to normal flow.
+// tryBufferMCPPost stashes MCP JSON-RPC POST /messages/ requests by jsonrpc id for SSE pairing later.
 func (p *parser) tryBufferMCPPost(key connKey, req *http.Request) ([]byte, float64, string, any, bool) {
 	if req.Method != "POST" {
 		return nil, 0, "", nil, false
@@ -312,7 +268,7 @@ func (p *parser) tryBufferMCPPost(key connKey, req *http.Request) ([]byte, float
 		return nil, 0, "", nil, false
 	}
 	idV, hasID := j["id"]
-	if !hasID { // notification (no response expected)
+	if !hasID {
 		return nil, 0, "", nil, false
 	}
 	id, ok := idV.(float64)
@@ -343,14 +299,8 @@ func (p *parser) tryBufferMCPPost(key connKey, req *http.Request) ([]byte, float
 	return body, id, method, args, true
 }
 
-// maybeEmitSSEFrames processes new bytes in readBuf for an SSE response.
-// When the response is text/event-stream it emits one AgentEvent per
-// complete `data: {...}` frame (pairing MCP JSON-RPC results with their
-// buffered POST request, or emitting standalone events otherwise).
-// Returns true if this read was handled as an SSE stream — caller should
-// NOT fall through to the normal responseComplete path.
+// maybeEmitSSEFrames emits one AgentEvent per complete `data:` frame for MCP-paired streams.
 func (p *parser) maybeEmitSSEFrames(key connKey, req *http.Request) bool {
-	// Need headers before we can classify as SSE.
 	headerEnd := bytes.Index(p.readBuf[key], []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		return false
@@ -361,22 +311,16 @@ func (p *parser) maybeEmitSSEFrames(key connKey, req *http.Request) bool {
 	}
 
 	bodyStart := headerEnd + 4
-	// Decode chunked transfer encoding (MCP FastMCP uses it by default).
 	body := p.readBuf[key][bodyStart:]
 	if bytes.Contains(head, []byte("\r\ntransfer-encoding: chunked")) {
 		body = unchunk(body)
 	}
 
-	// Normalize CRLF → LF so frame boundary detection only has to look for
-	// "\n\n". SSE streams on the wire use CRLF; this is robust either way.
 	body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
 
-	// Process frames past the last emitted offset. Frames terminate on
-	// double-newline. Keep already-emitted frames' byte positions via
-	// sseEmittedBytes.
 	already := p.sseEmittedBytes[key]
 	if already > len(body) {
-		already = 0 // buffer was trimmed
+		already = 0
 	}
 	remainder := body[already:]
 	const sep = "\n\n"
@@ -394,10 +338,6 @@ func (p *parser) maybeEmitSSEFrames(key connKey, req *http.Request) bool {
 	return true
 }
 
-// emitSSEFrame turns one SSE frame into an AgentEvent. Frame shape:
-//	event: message
-//	data: {"jsonrpc":"2.0","id":0,"result":{...}}
-// or any subset. MCP JSON-RPC responses are paired with their buffered POST.
 func (p *parser) emitSSEFrame(key connKey, req *http.Request, frame []byte) {
 	if p.emit == nil {
 		return
@@ -418,7 +358,6 @@ func (p *parser) emitSSEFrame(key connKey, req *http.Request, frame []byte) {
 		return
 	}
 
-	// MCP JSON-RPC response: pair with pending POST by id.
 	if j["jsonrpc"] == "2.0" {
 		if id, ok := j["id"].(float64); ok {
 			if pending, ok := p.mcpPending[key.PID][id]; ok {
@@ -426,28 +365,19 @@ func (p *parser) emitSSEFrame(key connKey, req *http.Request, frame []byte) {
 				delete(p.mcpPending[key.PID], id)
 				return
 			}
-			// Unpaired (e.g., daemon started mid-session) — emit alone.
 			p.emit(p.buildMCPStandaloneEvent(key, req, j))
 			return
 		}
 	}
-	// Non-RPC SSE frame (LLM streaming chunk, MCP endpoint announcement) —
-	// fall through to normal stream-close summarization path. Nothing to emit
-	// per-frame; the terminal buildEvent() still runs on stream close.
 }
 
 func (p *parser) buildMCPPairedEvent(key connKey, pending *pendingMCPPost, resObj map[string]any) *AgentEvent {
-	// Register the peer as MCP so subsequent calls that bypass the SSE
-	// pairing path (notifications, non-id requests) classify correctly.
 	registerEndpoint(p.mcpEndpoints, pending.peer, maxMCPEndpoints, "MCP")
 	latency := time.Since(pending.reqTime).Seconds() * 1000
 	reqBodyMap := map[string]any{
 		"jsonrpc": "2.0",
 		"method":  pending.method,
 	}
-	// Rebuild a `params` map when we have meaningful data. Keeping the
-	// printer's contract {"name", "arguments"} makes `tools/call add({...})`
-	// render consistently; other methods can use a bare arguments blob.
 	if pending.toolName != "" || pending.arguments != nil {
 		params := map[string]any{}
 		if pending.toolName != "" {
@@ -495,8 +425,6 @@ func (p *parser) buildMCPStandaloneEvent(key connKey, req *http.Request, resObj 
 	}
 }
 
-// unchunk strips HTTP/1.1 chunked-transfer framing from a body. Returns
-// the original bytes if framing is malformed (best-effort).
 func unchunk(b []byte) []byte {
 	var out []byte
 	for len(b) > 0 {
@@ -566,8 +494,6 @@ func trimToHTTPResponse(b []byte) []byte {
 	return b
 }
 
-// requestComplete mirrors responseComplete for requests. Some clients send
-// headers and body in separate SSL_write calls.
 func requestComplete(b []byte) bool {
 	headerEnd := bytes.Index(b, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
@@ -597,14 +523,7 @@ func requestComplete(b []byte) bool {
 	return true
 }
 
-// responseComplete reports whether b holds a complete HTTP/1 response
-// (headers terminated by CRLFCRLF, plus either Content-Length bytes of body
-// or a chunked terminator).
-//
-// For Server-Sent Events (text/event-stream), the stream is considered
-// complete when a terminal marker ("data: [DONE]") appears in the body,
-// so agents that stream LLM tokens can be emitted without waiting for
-// TCP close or transfer-encoding chunked terminator.
+// responseComplete: SSE streams end on "data: [DONE]" or chunked terminator.
 func responseComplete(b []byte) bool {
 	headerEnd := bytes.Index(b, []byte("\r\n\r\n"))
 	if headerEnd < 0 {
@@ -615,8 +534,6 @@ func responseComplete(b []byte) bool {
 	lowerHead := bytes.ToLower(head)
 
 	if bytes.Contains(lowerHead, []byte("content-type: text/event-stream")) {
-		// SSE streams end either with an OpenAI-style "data: [DONE]" marker
-		// or (for providers like Gemini) with just the HTTP chunked terminator.
 		body := b[bodyStart:]
 		if bytes.Contains(body, []byte("data: [DONE]")) {
 			return true
@@ -637,13 +554,12 @@ func responseComplete(b []byte) bool {
 		var n int
 		for _, c := range bytes.TrimSpace(rest) {
 			if c < '0' || c > '9' {
-				return true // malformed → accept what we have
+				return true
 			}
 			n = n*10 + int(c-'0')
 		}
 		return len(b)-bodyStart >= n
 	}
-	// No length info → treat as complete once we have headers + some body.
 	return true
 }
 
@@ -683,25 +599,10 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 	}
 }
 
-// classifyComm returns the comm-type label. Ordering matters:
-//
-//  1. configPeers — user-declared overrides (YAML + -peer flag), highest priority
-//  2. llmHosts — static well-known LLM API hostnames (O(1), short-circuit)
-//  3. llmEndpoints / mcpEndpoints — peers previously tagged by signature
-//  4. isLLMResponse — OpenAI/Anthropic/Ollama/Gemini response shape → register + Model
-//  5. isInitializeHandshake — MCP initialize round-trip → register + MCP
-//  6. MCP method fallback — tools/*, resources/*, prompts/* for mid-session attach
-//  7. isA2AProtocol — Google A2A tasks/* or /.well-known/agent.json
-//  8. isLangGraphProtocol — /threads, /runs/{wait,stream,batch}
-//  9. Unknown — everything else (health checks, metrics, unknown services)
-//
-// Maps are accessed under the parser mutex.
+// classifyComm priority: configPeers → llmHosts → registered endpoints → response shape → MCP → A2A → LangGraph → Unknown.
 func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers map[string]string, llmReg, mcpReg map[string]struct{}) string {
 	host := strings.Split(peer, ":")[0]
 
-	// 1. Explicit user override — full peer first, then bare host fallback
-	//    (so a user writing "api.openai.com" matches both "api.openai.com"
-	//    and "api.openai.com:443" forms).
 	if v, ok := cfgPeers[peer]; ok {
 		return v
 	}
@@ -715,7 +616,6 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 		return "Agent↔Model"
 	}
 
-	// Fast paths for already-registered endpoints.
 	if _, ok := llmReg[peer]; ok {
 		return "Agent↔Model"
 	}
@@ -723,13 +623,11 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 		return "Agent↔MCP"
 	}
 
-	// LLM response fingerprint (covers Ollama / vLLM / LiteLLM self-hosted).
 	if isLLMResponse(resBody) {
 		registerEndpoint(llmReg, peer, maxLLMEndpoints, "LLM")
 		return "Agent↔Model"
 	}
 
-	// MCP: strong signal = initialize handshake with protocolVersion.
 	for _, body := range [][]byte{reqBody, resBody} {
 		if isInitializeHandshake(body) {
 			registerEndpoint(mcpReg, peer, maxMCPEndpoints, "MCP")
@@ -737,7 +635,6 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 		}
 	}
 
-	// MCP fallback: tools/*, resources/*, prompts/* method in JSON-RPC body.
 	for _, body := range [][]byte{reqBody, resBody} {
 		if hasMCPMethod(body) {
 			registerEndpoint(mcpReg, peer, maxMCPEndpoints, "MCP")
@@ -745,7 +642,6 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 		}
 	}
 
-	// Agent↔Agent: only when we can identify the protocol explicitly.
 	if isA2AProtocol(reqBody, method, path) {
 		return "Agent↔Agent"
 	}
@@ -756,14 +652,11 @@ func classifyComm(peer, method, path string, reqBody, resBody []byte, cfgPeers m
 	return "Unknown"
 }
 
-// isLLMResponse detects the canonical response shape of the major LLM
-// providers. Works on both plain JSON bodies and raw SSE bodies (looks
-// inside the first `data:` event payload).
+// isLLMResponse matches OpenAI/Anthropic/Ollama/Gemini response shape on plain JSON or SSE body.
 func isLLMResponse(body []byte) bool {
 	if matchLLMShape(body) {
 		return true
 	}
-	// SSE: scan a bounded number of data: lines from the front.
 	if bytes.Contains(body, []byte("\ndata:")) || bytes.HasPrefix(body, []byte("data:")) {
 		scanned := 0
 		for _, line := range bytes.Split(body, []byte("\n")) {
@@ -792,16 +685,12 @@ func matchLLMShape(body []byte) bool {
 	if json.Unmarshal(body, &j) != nil {
 		return false
 	}
-	// OpenAI chat/text completions (incl. streaming "chat.completion.chunk")
-	if obj, _ := j["object"].(string); strings.HasPrefix(obj, "chat.completion") ||
-		obj == "text_completion" {
+	if obj, _ := j["object"].(string); strings.HasPrefix(obj, "chat.completion") || obj == "text_completion" {
 		return true
 	}
-	// Anthropic non-streaming messages
 	if j["type"] == "message" && j["role"] == "assistant" {
 		return true
 	}
-	// Anthropic streaming first event
 	if j["type"] == "message_start" {
 		if m, _ := j["message"].(map[string]any); m != nil {
 			if m["type"] == "message" && m["role"] == "assistant" {
@@ -809,13 +698,11 @@ func matchLLMShape(body []byte) bool {
 			}
 		}
 	}
-	// Ollama native (/api/chat, /api/generate): "done" and "model" present
 	_, hasDone := j["done"]
 	_, hasModel := j["model"]
 	if hasDone && hasModel {
 		return true
 	}
-	// Gemini native (:generateContent, :streamGenerateContent)
 	_, hasCandidates := j["candidates"]
 	_, hasModelVersion := j["modelVersion"]
 	if hasCandidates && hasModelVersion {
@@ -824,9 +711,7 @@ func matchLLMShape(body []byte) bool {
 	return false
 }
 
-// isInitializeHandshake returns true when body is an MCP `initialize`
-// request. MCP mandates `params.protocolVersion`; no other JSON-RPC 2.0
-// service uses this exact shape.
+// isInitializeHandshake: MCP `initialize` with `params.protocolVersion` is unique to MCP.
 func isInitializeHandshake(body []byte) bool {
 	var j map[string]any
 	if json.Unmarshal(body, &j) != nil {
@@ -846,9 +731,7 @@ func isInitializeHandshake(body []byte) bool {
 	return has
 }
 
-// hasMCPMethod returns true if body is a JSON-RPC 2.0 request whose method
-// is in the MCP namespace (tools/*, resources/*, prompts/*). Used as a
-// fallback when the daemon joins an MCP session mid-way.
+// hasMCPMethod: tools/* / resources/* / prompts/* JSON-RPC method (mid-session attach fallback).
 func hasMCPMethod(body []byte) bool {
 	var j map[string]any
 	if json.Unmarshal(body, &j) != nil || j["jsonrpc"] != "2.0" {
@@ -860,10 +743,7 @@ func hasMCPMethod(body []byte) bool {
 		strings.HasPrefix(m, "prompts/")
 }
 
-// isA2AProtocol detects Google Agent-to-Agent protocol traffic. Covers
-// both the legacy and current (a2a-sdk ≥ 0.3) method/path conventions.
 func isA2AProtocol(reqBody []byte, method, path string) bool {
-	// Agent Card discovery — both spellings used in the wild.
 	cleanPath := path
 	if i := strings.IndexByte(cleanPath, '?'); i >= 0 {
 		cleanPath = cleanPath[:i]
@@ -874,9 +754,6 @@ func isA2AProtocol(reqBody []byte, method, path string) bool {
 			return true
 		}
 	}
-	// JSON-RPC 2.0 A2A methods — current SDK uses `message/send`,
-	// `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/pushNotificationConfig/*`,
-	// `tasks/resubscribe`. Legacy spec used `tasks/send`.
 	var j map[string]any
 	if json.Unmarshal(reqBody, &j) == nil && j["jsonrpc"] == "2.0" {
 		m, _ := j["method"].(string)
@@ -889,10 +766,6 @@ func isA2AProtocol(reqBody []byte, method, path string) bool {
 	return false
 }
 
-// isLangGraphProtocol detects LangGraph Agent Protocol REST endpoints.
-// Matches only the specific paths from the spec (POST /threads, runs
-// subpaths) to avoid false positives from generic `/runs` or `/threads`
-// endpoints in unrelated services.
 func isLangGraphProtocol(path string) bool {
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
@@ -907,8 +780,6 @@ func isLangGraphProtocol(path string) bool {
 	return false
 }
 
-// registerEndpoint adds peer to reg, capped at max. Emits a log line the
-// first time a peer is registered so operators see classifier state grow.
 func registerEndpoint(reg map[string]struct{}, peer string, max int, label string) {
 	if peer == "" {
 		return
@@ -1002,16 +873,7 @@ func tryJSON(b []byte) any {
 	return string(b)
 }
 
-// decodeSSEBody parses a Server-Sent Events body and merges the deltas into
-// a single response. Text fragments from provider-specific delta formats
-// (OpenAI `choices[].delta.content`, Anthropic `delta.text`, Gemini
-// `candidates[].content.parts[].text`, plus simple `delta` / `text` /
-// `content` strings) are concatenated. The terminal `[DONE]` sentinel
-// and non-`data:` framing lines are ignored. Useful metadata from the
-// final event (finishReason, usageMetadata, modelVersion, responseId) is
-// preserved so callers can still see why generation stopped and how many
-// tokens were consumed. If no text can be extracted the raw event list
-// is returned instead.
+// decodeSSEBody merges per-provider delta fragments into a single text + preserves trailing metadata.
 func decodeSSEBody(b []byte) any {
 	if len(b) == 0 {
 		return ""
@@ -1051,7 +913,6 @@ func mergeSSEEvents(events []any) any {
 		buf.WriteString(extractSSEText(obj))
 	}
 	if buf.Len() == 0 {
-		// No text extracted — keep the event list verbatim so debugging info isn't lost.
 		return events
 	}
 	out := map[string]any{
@@ -1064,7 +925,7 @@ func mergeSSEEvents(events []any) any {
 				out[k] = v
 			}
 		}
-		// Gemini nests finishReason inside candidates[0].
+		// Gemini nests finishReason under candidates[0].
 		if _, has := out["finishReason"]; !has {
 			if cands, ok := lastObj["candidates"].([]any); ok && len(cands) > 0 {
 				if c0, ok := cands[0].(map[string]any); ok {
@@ -1126,13 +987,12 @@ func extractSSEText(ev map[string]any) string {
 			return b.String()
 		}
 	}
-	// Anthropic: delta.text (content_block_delta events)
+	// Anthropic: delta.text
 	if delta, ok := ev["delta"].(map[string]any); ok {
 		if t, ok := delta["text"].(string); ok {
 			return t
 		}
 	}
-	// Generic fallbacks
 	if s, ok := ev["delta"].(string); ok {
 		return s
 	}
@@ -1145,8 +1005,6 @@ func extractSSEText(ev map[string]any) string {
 	return ""
 }
 
-// isSSEContentType reports whether the given Content-Type header value
-// represents a Server-Sent Events stream.
 func isSSEContentType(ct string) bool {
 	return strings.Contains(strings.ToLower(ct), "text/event-stream")
 }

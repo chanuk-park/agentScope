@@ -45,6 +45,7 @@ type h2Stream struct {
 	pendingActive   bool
 }
 
+// cfgPeers/llmReg/mcpReg are shared references to the parser's maps.
 type h2Conn struct {
 	sendBuf         []byte
 	recvBuf         []byte
@@ -52,9 +53,9 @@ type h2Conn struct {
 	recvDec         *hpack.Decoder
 	streams         map[uint32]*h2Stream
 	prefaceConsumed bool
-	cfgPeers        map[string]string   // shared reference to parser.configPeers
-	llmReg          map[string]struct{} // shared reference to parser.llmEndpoints
-	mcpReg          map[string]struct{} // shared reference to parser.mcpEndpoints
+	cfgPeers        map[string]string
+	llmReg          map[string]struct{}
+	mcpReg          map[string]struct{}
 }
 
 func newH2Conn(cfgPeers map[string]string, llmReg, mcpReg map[string]struct{}) *h2Conn {
@@ -81,8 +82,7 @@ func (c *h2Conn) stream(id uint32) *h2Stream {
 	return s
 }
 
-// feed consumes SSL event bytes and returns a completed AgentEvent when a
-// stream has observed END_STREAM in both directions.
+// feed returns an AgentEvent once a stream sees END_STREAM in both directions.
 func (c *h2Conn) feed(sendDir bool, data []byte, peer, hostname string, pid uint32) *AgentEvent {
 	var buf *[]byte
 	if sendDir {
@@ -233,10 +233,7 @@ func (c *h2Conn) maybeEmit(s *h2Stream, streamID uint32, peer, hostname string, 
 		return nil
 	}
 	if !s.resEnded {
-		// Server-Sent Events: emit as soon as the terminal "[DONE]" marker
-		// appears in the response body. The server normally closes the stream
-		// right after, but we don't wait — streaming LLM responses can be
-		// shown to the user immediately.
+		// SSE: emit on "[DONE]" marker without waiting for stream close.
 		if !isSSEResponse(s.resHeaders) ||
 			!bytes.Contains(s.resBody.Bytes(), []byte("data: [DONE]")) {
 			return nil

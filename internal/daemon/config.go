@@ -10,7 +10,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Valid comm-type labels accepted in peer overrides.
 var validCommTypes = map[string]struct{}{
 	"Agent↔Model": {},
 	"Agent↔Agent": {},
@@ -18,20 +17,7 @@ var validCommTypes = map[string]struct{}{
 	"Unknown":     {},
 }
 
-// Config is the on-disk YAML schema.
-//
-//   peers:
-//     "10.0.0.2:8080":      "Agent↔Agent"
-//     "ollama.local:11434": "Agent↔Model"
-//     "my-mcp-server:3000": "Agent↔MCP"
-//
-//   llm_hostnames: ["api.openai.com", "api.anthropic.com"]
-//   llm_hostname_patterns: ["*.openai.azure.com", "bedrock-runtime.*.amazonaws.com"]
-//   llm_http_paths: ["POST /v1/chat/completions", "POST /api/generate"]
-//
-// Peers map keys may be full `host:port` or bare `host` (the classifier
-// checks both). LLM lists are merged on top of the built-in defaults from
-// detector.go — operators add to, never replace, the baked-in list.
+// Config is the YAML schema; see agentscope.yaml.sample for usage. LLM lists merge on top of detector.go builtins.
 type Config struct {
 	Peers               map[string]string `yaml:"peers"`
 	LLMHostnames        []string          `yaml:"llm_hostnames"`
@@ -39,9 +25,7 @@ type Config struct {
 	LLMHTTPPaths        []string          `yaml:"llm_http_paths"`
 }
 
-// LoadConfigFile reads a YAML config from path. If the file does not exist,
-// returns (nil, nil) — configuration is optional. Malformed YAML or
-// unknown comm types surface as errors.
+// LoadConfigFile returns (nil, nil) for ENOENT — config is optional.
 func LoadConfigFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -62,8 +46,7 @@ func LoadConfigFile(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// ParsePeerFlags converts repeated `-peer k=v` CLI values into a map.
-// Overrides a previous entry with the same key — later flag wins.
+// ParsePeerFlags: repeated `-peer k=v` → map; later flag wins on conflict.
 func ParsePeerFlags(pairs []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, p := range pairs {
@@ -81,9 +64,7 @@ func ParsePeerFlags(pairs []string) (map[string]string, error) {
 	return out, nil
 }
 
-// BuildPeerOverrides loads the YAML config (if present) and merges CLI
-// -peer overrides on top — CLI wins on conflict. Returns a merged map
-// and logs what was loaded so operators can confirm visually.
+// BuildPeerOverrides merges YAML peers + CLI -peer flags (CLI wins).
 func BuildPeerOverrides(configPath string, cliPairs []string) (map[string]string, error) {
 	merged := map[string]string{}
 
@@ -105,7 +86,7 @@ func BuildPeerOverrides(configPath string, cliPairs []string) (map[string]string
 	if len(cli) > 0 {
 		log.Printf("config: %d peer overrides from -peer flag", len(cli))
 		for k, v := range cli {
-			merged[k] = v // CLI wins
+			merged[k] = v
 		}
 	}
 
@@ -115,13 +96,12 @@ func BuildPeerOverrides(configPath string, cliPairs []string) (map[string]string
 	return merged, nil
 }
 
-// peerListFlag implements flag.Value so `-peer k=v` can repeat.
+// peerListFlag: flag.Value implementation so `-peer k=v` can repeat.
 type peerListFlag []string
 
 func (p *peerListFlag) String() string     { return strings.Join(*p, ",") }
 func (p *peerListFlag) Set(s string) error { *p = append(*p, s); return nil }
 
-// NewPeerListFlag returns a flag.Value suitable for flag.Var registration.
 func NewPeerListFlag(backing *[]string) *peerListFlag {
 	return (*peerListFlag)(backing)
 }

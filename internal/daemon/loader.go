@@ -19,16 +19,12 @@ type RawEvent struct {
 	PID         uint32
 	TID         uint32
 	TimestampNs uint64
-	// Conn is the SSL* pointer for TLS captures and the struct sock* pointer
-	// for plaintext / candidate captures. Combined with Source, it uniquely
-	// identifies a connection (the two pointer spaces don't collide once
-	// Source is keyed into the lookup).
-	Conn    uint64
-	DstIP   uint32 // BE network byte order; meaningful for SOURCE_CANDIDATE
-	DstPort uint16 // BE network byte order; meaningful for SOURCE_CANDIDATE
-	Dir     uint8  // DIR_WRITE/DIR_READ for TLS+PLAIN; protocol hint (1=HTTP, 2=TLS) for CANDIDATE
-	Source  uint8  // 0 = TLS, 1 = PLAIN, 2 = CANDIDATE
-	Data    []byte
+	Conn        uint64 // SSL* (TLS) or struct sock* (PLAIN/CANDIDATE) — pair with Source
+	DstIP       uint32 // BE; meaningful only for SOURCE_CANDIDATE
+	DstPort     uint16 // BE; meaningful only for SOURCE_CANDIDATE
+	Dir         uint8  // DIR_WRITE/READ for TLS+PLAIN; protocol hint (1=HTTP, 2=TLS) for CANDIDATE
+	Source      uint8  // 0=TLS, 1=PLAIN, 2=CANDIDATE
+	Data        []byte
 }
 
 const sourceCandidate uint8 = 2
@@ -80,9 +76,6 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 		links = append(links, l)
 	}
 
-	// Plaintext path: tcp_sendmsg/tcp_recvmsg kprobes. Same agent_pids
-	// filter inside BPF; same ringbuf; events flagged with SOURCE_PLAIN
-	// so the parser keeps TLS and plaintext flows distinct downstream.
 	kprobes := []struct {
 		sym  string
 		prog *ebpf.Program
@@ -126,16 +119,7 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 	sender := newSender(masterAddr, hostname)
 	go sender.run()
 
-	// Discovery: candidates come in via SOURCE_CANDIDATE events from the
-	// tcp_sendmsg kprobe; the detector matches them against LLM endpoint
-	// rules and writes promoted PIDs into objs.AgentPids. The static
-	// /proc-scan promotion was removed — we now learn agents from their
-	// outbound traffic, not their environment.
 	det := newDetector(rules, objs.AgentPids, parser, cmdlineFilter, 5*time.Minute)
-	// Every event the parser produces — terminal HTTP/1 round-trips and the
-	// per-frame SSE/MCP side channel both — flows through the detector before
-	// reaching the sender. Confirmation acts on these signals; demotion drops
-	// the PID out of agent_pids so subsequent traffic stops costing capacity.
 	forward := func(ev *AgentEvent) {
 		det.observeEvent(ev)
 		sender.enqueue(ev)
@@ -173,9 +157,8 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 	}
 }
 
+// parseRawEvent layout matches struct capture_event in bpf/capture.h.
 func parseRawEvent(b []byte) RawEvent {
-	// capture_event layout (matches bpf/capture.h):
-	//   pid(4) tid(4) ts(8) conn(8) dst_ip(4) dst_port(2) dir(1) source(1) data_len(4) data(N)
 	e := RawEvent{
 		PID:         binary.LittleEndian.Uint32(b[0:4]),
 		TID:         binary.LittleEndian.Uint32(b[4:8]),
@@ -195,21 +178,16 @@ func parseRawEvent(b []byte) RawEvent {
 	return e
 }
 
-// isNoiseEvent returns true for events whose payload is overwhelmingly zero —
-// these appear when bpf_probe_read_user fails or the userspace buffer
-// hadn't been written to yet. They don't correspond to real SSL traffic.
-// Small frames (HTTP/2 empty DATA/PING/WINDOW) can legitimately be mostly
-// zero, so only large events are filtered by the density check.
+// isNoiseEvent drops mostly-zero payloads (failed bpf_probe_read_user reads). Skips small HTTP/2 control frames.
 func isNoiseEvent(b []byte) bool {
 	if len(b) == 0 {
 		return true
 	}
-	// Fast path: small events never filtered — HTTP/2 minimal frames are 9 bytes.
 	if len(b) < 64 {
 		return false
 	}
 	nonZero := 0
-	threshold := len(b) / 32 // require at least ~3% non-zero bytes
+	threshold := len(b) / 32
 	if threshold < 8 {
 		threshold = 8
 	}

@@ -22,8 +22,6 @@ type monitorServer struct {
 	hostByIP map[string]string // daemon source IP → -host value
 }
 
-// learnDaemonIP records that the daemon at `ip` identifies itself as `host`.
-// Called on every event; idempotent so it tolerates re-connects.
 func (s *monitorServer) learnDaemonIP(ip, host string) {
 	if ip == "" || host == "" {
 		return
@@ -39,16 +37,13 @@ func (s *monitorServer) learnDaemonIP(ip, host string) {
 	s.hostMu.Unlock()
 }
 
-// rewritePeer replaces a bare-IP peer (like "10.10.10.173:8448") with the
-// hostname of the daemon running on that IP, when one is registered.
-// Leaves loopback / already-hostname peers untouched.
+// rewritePeer: bare-IP peer → registered daemon hostname.
 func (s *monitorServer) rewritePeer(p string) string {
 	host := p
 	port := ""
 	if i := strings.LastIndexByte(p, ':'); i >= 0 {
 		host, port = p[:i], p[i:]
 	}
-	// Only rewrite bare IPv4 / IPv6 addresses.
 	if !looksLikeIP(host) {
 		return p
 	}
@@ -66,10 +61,6 @@ func looksLikeIP(h string) bool {
 }
 
 func (s *monitorServer) StreamEvents(stream pb.AgentMonitor_StreamEventsServer) error {
-	// The gRPC peer gives us the daemon's source TCP address; the first
-	// event's Host field tells us what the daemon calls itself. Pair them
-	// so subsequent events from other daemons can render this daemon's IP
-	// as its hostname when it shows up as a peer (cross-host A2A/MCP).
 	srcIP := ""
 	if p, ok := peer.FromContext(stream.Context()); ok && p.Addr != nil {
 		addr := p.Addr.String()
@@ -78,10 +69,7 @@ func (s *monitorServer) StreamEvents(stream pb.AgentMonitor_StreamEventsServer) 
 		}
 	}
 
-	// Eagerly register IP→host from stream-open metadata. Daemons attach
-	// `x-agentscope-host` before sending any events; registering here closes
-	// the race where another daemon's first A2A event arrives first and
-	// would otherwise render with a bare-IP peer.
+	// Register IP→host from stream-open metadata to win the race against another daemon's first A2A event.
 	if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
 		if v := md.Get("x-agentscope-host"); len(v) > 0 {
 			s.learnDaemonIP(srcIP, v[0])

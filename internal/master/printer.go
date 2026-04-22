@@ -21,10 +21,7 @@ const (
 	cyan   = "\033[36m"
 )
 
-// hostPalette holds ANSI-256 foreground codes with high contrast against a
-// dark terminal, skipping colors already used for status (red/green/yellow)
-// and dim text (gray). Each daemon host gets a deterministic entry via FNV
-// hashing so the same host always renders in the same color.
+// hostPalette: ANSI-256 codes, FNV-hashed → same host always same color.
 var hostPalette = []int{39, 220, 208, 141, 51, 210, 118, 165, 45, 180}
 
 func hostColor(host string) string {
@@ -40,9 +37,7 @@ func hostColor(host string) string {
 	return fmt.Sprintf("\033[38;5;%dm", hostPalette[idx])
 }
 
-// formatHostPrefix renders a colored, fixed-width host column. If the name
-// is longer than the width, alignment is dropped rather than truncated so
-// hostnames remain searchable.
+// formatHostPrefix: colored fixed-width host column. Long names overflow rather than truncate (keeps grep working).
 func formatHostPrefix(host string) string {
 	color := hostColor(host)
 	label := host
@@ -70,16 +65,12 @@ type Event struct {
 
 type printer struct {
 	verbose bool
-	mu      sync.Mutex // serialises concurrent print() calls across gRPC streams
+	mu      sync.Mutex
 }
 
 func newPrinter(verbose bool) *printer { return &printer{verbose: verbose} }
 
-// print renders one event. Multiple daemons connect over gRPC and each gets
-// its own goroutine in the server, so concurrent print() calls are normal —
-// we assemble the whole event (header + req + res + separator) in a single
-// buffer and emit it with one os.Stdout.Write to keep lines from different
-// events from interleaving on screen.
+// print buffers the whole event and writes once under mu so concurrent gRPC streams don't interleave lines.
 func (p *printer) print(e *Event) {
 	ts := time.Unix(0, int64(e.Timestamp*1e9)).Format("15:04:05")
 	tag, ok := map[string]string{
@@ -99,8 +90,7 @@ func (p *printer) print(e *Event) {
 
 	method, _ := req["method"].(string)
 	path, _ := req["path"].(string)
-	// A2A card discovery: GET /.well-known/agent-card.json → no body, but
-	// the URL itself carries the semantic intent. Surface it as the req.
+	// A2A card discovery has no body — surface URL intent as req text.
 	if method == "GET" && (strings.HasSuffix(path, "/.well-known/agent-card.json") ||
 		strings.HasSuffix(path, "/.well-known/agent.json")) {
 		req["body"] = "discover peer agent card"
@@ -126,19 +116,13 @@ func (p *printer) print(e *Event) {
 	)
 
 	if p.verbose {
-		// Full, untruncated, pretty-indented bodies.
 		fmt.Fprintf(&buf, "  %sreq%s%s\n", gray, reset, prettyIndent(reqBody, -1))
 		fmt.Fprintf(&buf, "  %sres%s%s\n", gray, reset, prettyIndent(resBody, -1))
 	} else {
-		// Default: one-line semantic summary per body so LLM / MCP / A2A
-		// responses render with the same density as SSE merged responses.
 		fmt.Fprintf(&buf, "  %sreq%s%s\n", gray, reset, renderReq(reqBody))
 		fmt.Fprintf(&buf, "  %sres%s%s\n", gray, reset, renderRes(resBody))
 	}
 
-	// Single Write under a mutex: even if stdout is buffered/line-buffered,
-	// we guarantee no other goroutine can interleave between header and
-	// separator of this event.
 	p.mu.Lock()
 	_, _ = os.Stdout.WriteString(buf.String())
 	p.mu.Unlock()
@@ -162,9 +146,7 @@ func colorStatus(s int) string {
 	return str
 }
 
-// renderReq returns a one-line default-mode summary for a request body.
-// Tries in order: LLM last-user-message, JSON-RPC method+args, fallback
-// compact JSON. Goal is parity with SSE responses (also one line).
+// renderReq: one-line summary — LLM last-user-message → JSON-RPC method+args → compact JSON.
 func renderReq(body any) string {
 	if body == nil {
 		return "  " + gray + "(empty)" + reset
@@ -192,9 +174,7 @@ func renderReq(body any) string {
 	return "  " + compactAny(body, 140)
 }
 
-// renderRes returns a one-line default-mode summary for a response body.
-// Tries in order: SSE merged text, LLM assistant text, tool call,
-// provider error, JSON-RPC result summary, fallback compact JSON.
+// renderRes: one-line summary — SSE → LLM text → tool call → error → JSON-RPC result → compact JSON.
 func renderRes(body any) string {
 	if body == nil {
 		return "  " + gray + "(empty)" + reset
@@ -210,7 +190,6 @@ func renderRes(body any) string {
 		return "  " + compactAny(body, 140)
 	}
 
-	// SSE merged shape kept as-is (parity anchor).
 	if text, ok := m["text"].(string); ok {
 		if _, hasChunks := m["chunks"]; hasChunks {
 			suffix := ""
@@ -225,14 +204,10 @@ func renderRes(body any) string {
 			return "  " + fmt.Sprintf("%q", truncate(text, 200)) + suffix
 		}
 	}
-	// Provider error.
 	if errObj, ok := m["error"].(map[string]any); ok {
 		return "  " + red + formatProviderError(errObj) + reset
 	}
-	// LLM assistant text. Checked BEFORE tool_calls because some weak
-	// open-source models emit both a text answer and a spurious
-	// tool_call on the same response (non-compliant with OpenAI spec);
-	// in that case the content is what the caller actually uses.
+	// Text checked BEFORE tool_calls: some open-source models emit both, content is what the caller uses.
 	if text := extractLLMText(m); text != "" {
 		suffix := ""
 		if fr := extractFinishReason(m); fr != "" {
@@ -240,18 +215,14 @@ func renderRes(body any) string {
 		}
 		return "  " + fmt.Sprintf("%q", truncate(text, 200)) + suffix
 	}
-	// LLM tool call.
 	if tc := extractToolCall(m); tc != "" {
 		return "  " + cyan + tc + reset
 	}
-	// JSON-RPC result summary.
 	if res, ok := m["result"]; ok {
 		return "  " + green + "→" + reset + " " + summarizeJSONRPCResult(res)
 	}
 	return "  " + compactAny(body, 140)
 }
-
-// --- extraction helpers ---
 
 func extractLLMPrompt(m map[string]any) string {
 	// Gemini: contents[-1].parts[-1].text
@@ -266,13 +237,8 @@ func extractLLMPrompt(m map[string]any) string {
 			}
 		}
 	}
-	// OpenAI / Anthropic / Ollama: messages[*]
-	// In a ReAct loop the list grows each turn as [system?, user,
-	// ai(tool_call), tool, ai(tool_call), tool, ...]. Showing only the
-	// last item yields confusing "prompts" that are actually tool
-	// responses. Instead surface the ORIGINAL user instruction (the
-	// first user-role message), then annotate how many tool/assistant
-	// roundtrips have happened since.
+	// OpenAI/Anthropic/Ollama: surface the FIRST user message (ReAct loops grow [user, ai, tool, ai, ...]
+	// where the last item is a tool response, not a prompt). Annotate with tool-turn count.
 	if msgs, ok := m["messages"].([]any); ok && len(msgs) > 0 {
 		firstUser := ""
 		toolTurns := 0
@@ -295,20 +261,16 @@ func extractLLMPrompt(m map[string]any) string {
 			}
 			return firstUser
 		}
-		// Fallback: last message text (legacy behaviour).
 		if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
 			return extractMessageText(last)
 		}
 	}
-	// Ollama completion endpoint
 	if p, _ := m["prompt"].(string); p != "" {
 		return p
 	}
 	return ""
 }
 
-// extractMessageText pulls the text payload from one OpenAI / Anthropic
-// message regardless of whether content is a string or an array of blocks.
 func extractMessageText(msg map[string]any) string {
 	switch c := msg["content"].(type) {
 	case string:
@@ -325,12 +287,9 @@ func extractMessageText(msg map[string]any) string {
 	return ""
 }
 
-// llmRequestBadges returns inline annotations for non-text parts of a
-// request — tool declarations, image attachments — so users can see the
-// request was more than just a prompt without dumping full schemas.
+// llmRequestBadges: inline tags for non-text request parts (tool declarations, attachments).
 func llmRequestBadges(m map[string]any) string {
 	var badges []string
-	// Tools declared on the request
 	if tools, ok := m["tools"].([]any); ok && len(tools) > 0 {
 		names := collectToolNames(tools)
 		if len(names) > 0 {
@@ -339,7 +298,6 @@ func llmRequestBadges(m map[string]any) string {
 			badges = append(badges, fmt.Sprintf("tools: %d", len(tools)))
 		}
 	}
-	// Image / document attachments in the last message
 	if contents, ok := m["contents"].([]any); ok && len(contents) > 0 {
 		if last, ok := contents[len(contents)-1].(map[string]any); ok {
 			if parts, ok := last["parts"].([]any); ok {
@@ -592,16 +550,14 @@ func jsonRPCReqExtra(m map[string]any) string {
 	if params == nil {
 		return ""
 	}
-	// MCP tools/call: show tool name + arguments
+	// MCP tools/call: tool name + arguments
 	if n, _ := params["name"].(string); n != "" {
 		if args, ok := params["arguments"]; ok {
 			return n + "(" + compactAny(args, 120) + ")"
 		}
 		return n
 	}
-	// A2A message/send / tasks/send: message.parts[*].text (text may be
-	// nested under a "root" wrapper when the SDK serializes discriminated
-	// unions — handle both shapes).
+	// A2A message/send: text may be nested under "root" wrapper (SDK discriminated union) — handle both.
 	if msg, ok := params["message"].(map[string]any); ok {
 		if parts, ok := msg["parts"].([]any); ok && len(parts) > 0 {
 			for _, p := range parts {
@@ -626,7 +582,6 @@ func jsonRPCReqExtra(m map[string]any) string {
 	return ""
 }
 
-// shortID abbreviates long UUIDs for readability.
 func shortID(s string) string {
 	if len(s) > 12 {
 		return s[:8]
@@ -639,7 +594,7 @@ func summarizeJSONRPCResult(v any) string {
 	if !ok {
 		return compactAny(v, 120)
 	}
-	// MCP tools/call result → content[*].text
+	// MCP tools/call → content[*].text
 	if content, ok := m["content"].([]any); ok && len(content) > 0 {
 		var b strings.Builder
 		for _, c := range content {
@@ -656,7 +611,6 @@ func summarizeJSONRPCResult(v any) string {
 			return fmt.Sprintf("%q", truncate(b.String(), 160))
 		}
 	}
-	// MCP tools/list
 	if tools, ok := m["tools"].([]any); ok {
 		names := collectToolNames(tools)
 		if len(names) > 0 {
@@ -664,11 +618,10 @@ func summarizeJSONRPCResult(v any) string {
 		}
 		return fmt.Sprintf("%d tools", len(tools))
 	}
-	// MCP initialize
 	if pv, _ := m["protocolVersion"].(string); pv != "" {
 		return "protocolVersion " + pv
 	}
-	// A2A Message result (a2a-sdk ≥ 0.3): {"kind":"message","parts":[{"kind":"text","text":"..."}]}
+	// A2A message (a2a-sdk ≥ 0.3): {"kind":"message","parts":[...]}
 	if kind, _ := m["kind"].(string); kind == "message" {
 		if parts, ok := m["parts"].([]any); ok && len(parts) > 0 {
 			var b strings.Builder
@@ -687,7 +640,7 @@ func summarizeJSONRPCResult(v any) string {
 			}
 		}
 	}
-	// A2A legacy Task result with artifacts[0].parts[0].text
+	// A2A legacy Task: artifacts[0].parts[0].text
 	if artifacts, ok := m["artifacts"].([]any); ok && len(artifacts) > 0 {
 		if a0, ok := artifacts[0].(map[string]any); ok {
 			if parts, ok := a0["parts"].([]any); ok && len(parts) > 0 {
@@ -706,7 +659,6 @@ func summarizeJSONRPCResult(v any) string {
 			}
 		}
 	}
-	// A2A status only
 	if st, ok := m["status"].(map[string]any); ok {
 		if s, _ := st["state"].(string); s != "" {
 			return "state: " + s
@@ -723,9 +675,7 @@ func compactAny(v any, maxLen int) string {
 	return truncate(string(b), maxLen)
 }
 
-// prettyIndent marshals `v` as indented JSON, prefixed so it aligns under
-// the `req` / `res` label column. `maxStr` ≥ 0 additionally caps string
-// values via truncateStrings; pass -1 to disable.
+// prettyIndent: indented JSON, aligned under the req/res column. maxStr ≥ 0 caps string values; -1 disables.
 func prettyIndent(v any, maxStr int) string {
 	if maxStr >= 0 {
 		v = truncateStrings(v, maxStr)
@@ -737,9 +687,7 @@ func prettyIndent(v any, maxStr int) string {
 	return "\n      " + string(b)
 }
 
-// truncateStrings recursively walks `v` and caps any string value longer
-// than `maxLen` with an ellipsis + remaining-byte count marker. Non-string
-// leaves are returned unchanged.
+// truncateStrings recursively caps string values with an ellipsis + remaining-byte marker.
 func truncateStrings(v any, maxLen int) any {
 	switch x := v.(type) {
 	case string:

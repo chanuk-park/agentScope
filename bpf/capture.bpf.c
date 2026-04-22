@@ -31,9 +31,7 @@ struct {
     __type(value, struct tcp_recv_arg);
 } tcp_recv_args SEC(".maps");
 
-// Per-sock state for the agent-tracked plaintext path:
-//   1 = HTTP-confirmed (emit subsequent traffic)
-//   2 = TLS handshake observed (skip — handled by SSL_* uprobes)
+// per-sock state: 1=HTTP confirmed, 2=TLS skip (owned by SSL_* uprobes)
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 8192);
@@ -41,9 +39,7 @@ struct {
     __type(value, __u8);
 } tcp_flows SEC(".maps");
 
-// One bit per outbound sock for the discovery path: marks "we already emitted
-// a candidate event for this sock". Keeps non-agent processes from drowning
-// the ringbuf in repeat metadata. LRU so we don't need a tcp_close hook.
+// dedup: emit at most one CANDIDATE event per outbound sock
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 16384);
@@ -56,11 +52,7 @@ struct {
     __uint(max_entries, 64 * 1024 * 1024);
 } events SEC(".maps");
 
-// Userspace populates this dynamically. The detector promotes a PID into
-// this map only after observing it talk to a known LLM endpoint; from that
-// moment forward the SSL_* uprobes and the "PLAIN" tcp_sendmsg path emit
-// full payloads for the PID. The static /proc-scan promotion (env vars,
-// cmdline markers) was removed in favor of this discovery-driven model.
+// userspace detector promotes PIDs into here after observing LLM endpoint
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
@@ -199,16 +191,6 @@ int uprobe_ssl_read_ex_ret(struct pt_regs *ctx) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Plaintext + discovery path (kprobes on tcp_sendmsg / tcp_recvmsg).
-//
-// Two roles:
-//   - PID in agent_pids → full payload capture (SOURCE_PLAIN), TLS sock skip
-//   - PID not in agent_pids → one tiny CANDIDATE event per outbound HTTP/TLS
-//     socket so userspace can extract SNI / Host and decide whether to
-//     promote the PID into agent_pids.
-// ---------------------------------------------------------------------------
-
 static __always_inline int read_first_iov(struct msghdr *msg, __u64 *out_buf, __u32 *out_len) {
     struct iov_iter iter;
     __builtin_memset(&iter, 0, sizeof(iter));
@@ -245,9 +227,6 @@ static __always_inline int looks_like_http_start(const char h[8]) {
     return 0;
 }
 
-// Emits the discovery-mode metadata event. Carries dst IPv4:port plus the
-// first <=512 bytes of the first send (enough for SNI in ClientHello and
-// for Host: + request line in HTTP). source = SOURCE_CANDIDATE.
 static __always_inline void emit_candidate(struct sock *sk, __u64 buf, __u32 len, __u8 hint) {
     struct capture_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return;
@@ -285,10 +264,9 @@ int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
 
     if (bpf_map_lookup_elem(&agent_pids, &pid)) {
-        // ---- agent path: full plaintext capture ----
         __u8 *state = bpf_map_lookup_elem(&tcp_flows, &sk_key);
         if (state) {
-            if (*state == 2) return 0; // TLS sock — owned by SSL_* uprobes
+            if (*state == 2) return 0;
         } else {
             char head[8] = {};
             if (bpf_probe_read_user(head, sizeof(head), (void *)buf) < 0) return 0;
@@ -305,26 +283,21 @@ int kprobe_tcp_sendmsg(struct pt_regs *ctx) {
         return 0;
     }
 
-    // ---- discovery path: one candidate event per outbound sock ----
     if (bpf_map_lookup_elem(&candidate_emitted, &sk_key)) return 0;
 
-    // IPv4 only for MVP. IPv6 LLM traffic still gets full capture once the
-    // PID is promoted via a separately-observed IPv4 LLM call — agents
-    // typically use both paths.
     __u16 family = 0;
     bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
     if (family != 2 /* AF_INET */) return 0;
 
     __be32 daddr = 0;
     bpf_probe_read_kernel(&daddr, sizeof(daddr), &sk->__sk_common.skc_daddr);
-    // 127.0.0.0/8 — task scopes detection to "external traffic".
     if ((bpf_ntohl(daddr) >> 24) == 127) return 0;
 
     char head[8] = {};
     if (bpf_probe_read_user(head, sizeof(head), (void *)buf) < 0) return 0;
     __u8 hint = 0;
-    if ((__u8)head[0] == 0x16) hint = 2;          // TLS ClientHello
-    else if (looks_like_http_start(head)) hint = 1; // HTTP request line
+    if ((__u8)head[0] == 0x16) hint = 2;
+    else if (looks_like_http_start(head)) hint = 1;
     else return 0;
 
     __u8 v = 1;

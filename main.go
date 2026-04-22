@@ -18,11 +18,11 @@ func main() {
 	masterAddr := flag.String("master", "localhost:9000", "master gRPC 주소 (daemon mode)")
 	listen := flag.String("listen", ":9000", "listen 주소 (master mode)")
 	verbose := flag.Bool("v", false, "body 전체 출력")
-	host := flag.String("host", "", "hostname override (daemon mode, for multi-daemon demo)")
-	cmdlineFilter := flag.String("cmdline-filter", "", "restrict scanner to agent PIDs whose cmdline contains this substring (optional, for multi-daemon demo)")
-	configPath := flag.String("config", "./agentscope.yaml", "YAML config path (missing file is silently skipped)")
+	host := flag.String("host", "", "hostname override (daemon mode)")
+	cmdlineFilter := flag.String("cmdline-filter", "", "only promote PIDs whose cmdline contains this substring")
+	configPath := flag.String("config", "./agentscope.yaml", "YAML config path (optional)")
 	var peerPairs []string
-	flag.Var(daemon.NewPeerListFlag(&peerPairs), "peer", "override peer comm type, e.g. -peer '10.0.0.2:8080=Agent↔Agent' (repeatable)")
+	flag.Var(daemon.NewPeerListFlag(&peerPairs), "peer", "peer comm-type override, e.g. -peer '10.0.0.2:8080=Agent↔Agent' (repeatable)")
 	flag.Parse()
 
 	sig := make(chan os.Signal, 1)

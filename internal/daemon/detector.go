@@ -15,10 +15,7 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// Built-in LLM endpoint allowlist. YAML config adds to this — never replaces.
-// Why baked-in: most users will run agentscope without a config and the
-// commercial APIs below are stable enough that the daemon should detect
-// them out of the box.
+// Built-in LLM allowlist. YAML config adds to this — never replaces.
 var (
 	builtinHostnames = []string{
 		"api.openai.com",
@@ -34,8 +31,7 @@ var (
 		"bedrock-runtime.*.amazonaws.com",
 	}
 
-	// Path patterns for self-hosted LLMs (vLLM, Ollama, LiteLLM, llama.cpp,
-	// TGI, etc.) where SNI tells us nothing useful (private IPs, no TLS).
+	// Self-hosted LLM paths (vLLM, Ollama, LiteLLM, llama.cpp, TGI).
 	builtinHTTPPaths = []string{
 		"POST /v1/chat/completions",
 		"POST /v1/messages",
@@ -95,8 +91,7 @@ func BuildDetectorRules(extraHosts, extraPatterns, extraPaths []string) (*Detect
 	return r, nil
 }
 
-// compileGlob converts a hostname glob ('*' = one DNS label, no dots) into
-// an anchored regex. Only '*' is special; everything else is literal.
+// compileGlob: '*' = one DNS label (no dots); everything else literal.
 func compileGlob(g string) (*regexp.Regexp, error) {
 	parts := strings.Split(g, "*")
 	for i, p := range parts {
@@ -145,28 +140,9 @@ func (r *DetectorRules) matchHTTP(method, path string) bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// Detector: consumes SOURCE_CANDIDATE events, promotes matching PIDs into
-// the agent_pids BPF map, evicts dead PIDs, expires unmatched candidates.
-// ---------------------------------------------------------------------------
-
-// PID lifecycle in the detector:
-//
-//	┌──────────┐  endpoint match   ┌────────────┐  agent signal  ┌───────────┐
-//	│ pending  │ ────────────────▶ │ confirming │ ─────────────▶ │ confirmed │
-//	└──────────┘                   └────────────┘                └───────────┘
-//	      │                              │
-//	      │ TTL                          │ window timeout / no signal
-//	      ▼                              ▼
-//	  (forgotten)                   ┌─────────┐
-//	                                │ demoted │  ← never re-promoted while alive
-//	                                └─────────┘
-//
-// "Talks to LLM API" promotes only into `confirming` — full capture starts so
-// we can observe one of the agent signals (tools/functions in request body,
-// tool_calls/tool_use in response, MCP, A2A traffic). If none appears within
-// the window, the PID is demoted: chat WebUIs, one-shot scripts, and other
-// "just hits the LLM API" callers land here and stop consuming capacity.
+// PID lifecycle: pending → confirming → {confirmed, demoted}. Endpoint match
+// promotes pending→confirming; an agent signal (tools/MCP/A2A) confirms;
+// otherwise demote after window. demoted is sticky for the PID's lifetime.
 type detector struct {
 	rules       *DetectorRules
 	agentMap    *ebpf.Map
@@ -178,16 +154,16 @@ type detector struct {
 	confirmMaxEvents int
 
 	mu         sync.Mutex
-	pending    map[uint32]time.Time     // unmatched candidates (TTL bookkeeping)
-	confirming map[uint32]*confirmState // promoted, awaiting agent signal
-	confirmed  map[uint32]struct{}      // permanent agents
-	demoted    map[uint32]struct{}      // PIDs that lost the bet — keep out
+	pending    map[uint32]time.Time
+	confirming map[uint32]*confirmState
+	confirmed  map[uint32]struct{}
+	demoted    map[uint32]struct{}
 }
 
 type confirmState struct {
 	promotedAt time.Time
 	seenEvents int
-	reason     string // why we promoted (for the demote-log line)
+	reason     string
 }
 
 func newDetector(rules *DetectorRules, agentMap *ebpf.Map, parser *parser, cmdlineFilter string, ttl time.Duration) *detector {
@@ -210,9 +186,7 @@ func newDetector(rules *DetectorRules, agentMap *ebpf.Map, parser *parser, cmdli
 	}
 }
 
-// handle processes a SOURCE_CANDIDATE event. Cheap fast-paths short-circuit
-// when the PID is already classified, so it's safe to invoke inline from the
-// ringbuf reader.
+// handle dispatches a SOURCE_CANDIDATE event; safe to call inline from the ringbuf reader.
 func (d *detector) handle(ev RawEvent) {
 	d.mu.Lock()
 	if _, ok := d.confirmed[ev.PID]; ok {
@@ -280,11 +254,7 @@ func (d *detector) handle(ev RawEvent) {
 		ev.PID, reason, hostShown, formatDst(ev.DstIP, ev.DstPort))
 }
 
-// observeEvent inspects every parser-emitted AgentEvent. While a PID is in
-// the confirming state we look for an agent signal (tools/functions in the
-// request, tool_calls/tool_use in the response, or a CommType marking
-// Agent↔MCP / Agent↔Agent traffic). One match → confirm. None within the
-// window → demote. PIDs already confirmed or demoted bypass the work.
+// observeEvent: while a PID is confirming, look for an agent signal in each AgentEvent.
 func (d *detector) observeEvent(ev *AgentEvent) {
 	if ev == nil {
 		return
@@ -344,10 +314,6 @@ func (d *detector) demote(pid uint32, reason string) {
 		pid, reason)
 }
 
-// hasAgentSignal returns true if ev exhibits any of the agent-specific
-// patterns. CommType captures MCP and A2A flows already classified by the
-// parser; the body checks catch tool-using ReAct-style agents over plain
-// LLM endpoints (no MCP, no A2A).
 func hasAgentSignal(ev *AgentEvent) bool {
 	if ev.CommType == "Agent↔MCP" || ev.CommType == "Agent↔Agent" {
 		return true
@@ -368,9 +334,7 @@ func classifySignal(ev *AgentEvent) string {
 	return "tool_calls/tool_use in response body"
 }
 
-// hasToolKeyword does a substring scan on the JSON-encoded request/response
-// strings. JSON keys are quoted, so we can match the literal `"tools":` form
-// without false positives from arbitrary text inside content fields.
+// hasToolKeyword: JSON keys are quoted, so a literal substring match suffices.
 func hasToolKeyword(jsonStr string) bool {
 	if jsonStr == "" {
 		return false
@@ -383,9 +347,6 @@ func hasToolKeyword(jsonStr string) bool {
 	return false
 }
 
-// runJanitor evicts dead promoted PIDs and TTL-expires unmatched candidates.
-// 30s tick: fast enough for a snappy demo, slow enough to be invisible in
-// CPU profiles.
 func (d *detector) runJanitor(stop <-chan struct{}) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -413,8 +374,6 @@ func (d *detector) prune() {
 		}
 	}
 
-	// PIDs in confirming state past the time window without an agent signal
-	// are demoted via the same path as the event-count trigger.
 	var timedOut []uint32
 	for pid, st := range d.confirming {
 		if st.promotedAt.Before(confirmCutoff) {
@@ -422,7 +381,6 @@ func (d *detector) prune() {
 		}
 	}
 
-	// Dead PIDs leak across all four sets; reap them so the maps stay bounded.
 	var deadActive, deadDemoted []uint32
 	for pid := range d.confirming {
 		if !pidAlive(pid) {
@@ -470,18 +428,10 @@ func (d *detector) prune() {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Parsers
-// ---------------------------------------------------------------------------
-
-// extractSNI parses a TLS ClientHello and returns the server_name (host_name
-// type) extension value, or "" on any malformed/truncated input. All reads
-// are bounds-checked. Spec: RFC 6066 §3 + RFC 8446 §4.2.
+// extractSNI parses a TLS ClientHello server_name extension. RFC 6066 §3.
+// Returns "" on any malformed/truncated input. All reads bounds-checked.
 func extractSNI(data []byte) string {
-	// TLS Record:  type(1) version(2) length(2) = 5 bytes
-	// Handshake:   type(1) length(3)            = 4 bytes
-	// ClientHello: legacy_version(2) random(32) = 34 bytes
-	// → 43 bytes minimum before session_id.
+	// Record(5) + Handshake(4) + legacy_version(2) + random(32) = 43 bytes minimum.
 	if len(data) < 43 {
 		return ""
 	}
@@ -490,28 +440,24 @@ func extractSNI(data []byte) string {
 	}
 	pos := 43
 
-	// session_id
 	if pos+1 > len(data) {
 		return ""
 	}
 	sidLen := int(data[pos])
 	pos += 1 + sidLen
 
-	// cipher_suites
 	if pos+2 > len(data) {
 		return ""
 	}
 	csLen := int(binary.BigEndian.Uint16(data[pos : pos+2]))
 	pos += 2 + csLen
 
-	// compression_methods
 	if pos+1 > len(data) {
 		return ""
 	}
 	cmLen := int(data[pos])
 	pos += 1 + cmLen
 
-	// extensions
 	if pos+2 > len(data) {
 		return ""
 	}
@@ -531,7 +477,6 @@ func extractSNI(data []byte) string {
 			return ""
 		}
 		if extType == 0x0000 {
-			// SNI: server_name_list_length(2) then entries.
 			ePos := pos
 			if ePos+2 > extEnd {
 				return ""
@@ -555,9 +500,7 @@ func extractSNI(data []byte) string {
 	return ""
 }
 
-// parseHTTPMeta extracts the request line (method, path) and Host: header
-// from a partial HTTP/1.1 request. Returns zero values if any required field
-// can't be found in the input window.
+// parseHTTPMeta extracts request line + Host header from a partial HTTP/1.1 request.
 func parseHTTPMeta(data []byte) (method, path, host string) {
 	nl := bytes.IndexByte(data, '\n')
 	if nl < 0 {
@@ -589,10 +532,6 @@ func parseHTTPMeta(data []byte) (method, path, host string) {
 	return
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 func pidAlive(pid uint32) bool {
 	_, err := os.Stat("/proc/" + strconv.FormatUint(uint64(pid), 10))
 	return err == nil
@@ -606,8 +545,7 @@ func pidCmdlineContains(pid uint32, needle []byte) bool {
 	return bytes.Contains(b, needle)
 }
 
-// formatDst renders the BPF event's __be32 dst_ip and __be16 dst_port (read
-// raw, host byte order = little-endian on x86) as a familiar 1.2.3.4:port.
+// formatDst renders __be32 dst_ip / __be16 dst_port (raw little-endian uints) as 1.2.3.4:port.
 func formatDst(ip uint32, port uint16) string {
 	a := byte(ip)
 	b := byte(ip >> 8)

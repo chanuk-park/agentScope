@@ -1,0 +1,8 @@
+# 특정 디렉토리 무시
+/bench/
+
+# (선택 사항) 운영체제나 IDE에서 생성되는 불필요한 파일들
+.DS_Store
+node_modules/
+dist/
+.env

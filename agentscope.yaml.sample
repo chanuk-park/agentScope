@@ -1,35 +1,22 @@
-# agentscope daemon config (optional — agentscope.yaml). Missing file is OK.
+# agentscope daemon config (./agentscope.yaml). Optional — missing file is OK.
 
-# Peer overrides: force a comm-type label for traffic to specific destinations.
-# Used by the parser's classifier *after* an event is emitted (i.e. only for
-# already-tracked agent PIDs).
+# Peer overrides: force a comm-type label for already-tracked agents' traffic.
 peers:
   # "10.0.0.2:8080":      "Agent↔Agent"
   # "ollama.local:11434": "Agent↔Model"
   # "my-mcp-server:3000": "Agent↔MCP"
 
-# LLM endpoint allowlists — control which destinations promote a non-tracked
-# PID into agent_pids. Merged with the baked-in defaults in detector.go.
-#
-# llm_hostnames: exact-match SNI (TLS) or HTTP Host: header (plaintext).
+# Exact-match SNI / Host. Merged on top of detector.go builtins.
 llm_hostnames:
   # - api.openai.com
   # - api.anthropic.com
-  # - generativelanguage.googleapis.com
-  # - api.mistral.ai
-  # - api.cohere.ai
 
-# llm_hostname_patterns: glob-style ('*' matches any one label segment).
-# Compiled to regex at startup; bad patterns surface as a config error.
+# Glob-style ('*' matches one DNS label, no dots).
 llm_hostname_patterns:
   # - "*.openai.azure.com"
   # - "bedrock-runtime.*.amazonaws.com"
 
-# llm_http_paths: "<METHOD> <path-prefix>". Plaintext-only (TLS doesn't expose
-# the path during the handshake). Used to spot self-hosted OpenAI-compatible
-# servers (vLLM, Ollama, LiteLLM) where the SNI route is unavailable.
+# "<METHOD> <path-prefix>". Plaintext only — TLS hides the path.
 llm_http_paths:
   # - "POST /v1/chat/completions"
-  # - "POST /v1/messages"
-  # - "POST /v1/completions"
   # - "POST /api/generate"
