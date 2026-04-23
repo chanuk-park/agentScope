@@ -1,14 +1,12 @@
 package daemon
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/json"
 	"io"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +47,7 @@ type parser struct {
 	writeBuf map[connKey][]byte
 	readBuf  map[connKey][]byte
 	reqTime  map[connKey]time.Time
-	lastReq  map[connKey]*http.Request
+	lastReq  map[connKey]*httpReq
 	h2       map[connKey]*h2Conn
 	proto    map[connKey]byte // 0=unknown, 1=http/1, 2=http/2
 	hostname string
@@ -72,7 +70,7 @@ type parser struct {
 }
 
 type pendingMCPPost struct {
-	req       *http.Request
+	req       *httpReq
 	method    string
 	toolName  string
 	arguments any
@@ -147,7 +145,7 @@ func newParser(hostname string, configPeers map[string]string) *parser {
 		writeBuf:        make(map[connKey][]byte),
 		readBuf:         make(map[connKey][]byte),
 		reqTime:         make(map[connKey]time.Time),
-		lastReq:         make(map[connKey]*http.Request),
+		lastReq:         make(map[connKey]*httpReq),
 		sseEmittedBytes: make(map[connKey]int),
 		mcpPending:      make(map[uint32]map[float64]*pendingMCPPost),
 		h2:              make(map[connKey]*h2Conn),
@@ -193,16 +191,12 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		if !requestComplete(p.writeBuf[key]) {
 			return nil
 		}
-		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(p.writeBuf[key])))
+		req, err := parseHTTPReq(p.writeBuf[key])
 		if err != nil {
 			return nil
 		}
 
-		if bufferedBody, id, method, args, isRPC := p.tryBufferMCPPost(key, req); isRPC {
-			_ = bufferedBody
-			_ = id
-			_ = method
-			_ = args
+		if isRPC := p.tryBufferMCPPost(key, req); isRPC {
 			p.writeBuf[key] = nil
 			p.readBuf[key] = nil
 			p.lastReq[key] = nil
@@ -228,9 +222,7 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 		if !responseComplete(p.readBuf[key]) {
 			return nil
 		}
-		res, err := http.ReadResponse(
-			bufio.NewReader(bytes.NewReader(p.readBuf[key])), req,
-		)
+		res, err := parseHTTPRes(p.readBuf[key])
 		if err != nil {
 			return nil
 		}
@@ -244,36 +236,32 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 }
 
 // tryBufferMCPPost stashes MCP JSON-RPC POST /messages/ requests by jsonrpc id for SSE pairing later.
-func (p *parser) tryBufferMCPPost(key connKey, req *http.Request) ([]byte, float64, string, any, bool) {
+// Returns true if the request was buffered (caller drops normal flow for this event).
+func (p *parser) tryBufferMCPPost(key connKey, req *httpReq) bool {
 	if req.Method != "POST" {
-		return nil, 0, "", nil, false
+		return false
 	}
-	if !strings.Contains(req.URL.Path, "/messages") {
-		return nil, 0, "", nil, false
+	if !strings.Contains(req.Path, "/messages") {
+		return false
 	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, 0, "", nil, false
-	}
-	req.Body = io.NopCloser(bytes.NewReader(body))
 	var j map[string]any
-	if json.Unmarshal(body, &j) != nil {
-		return nil, 0, "", nil, false
+	if json.Unmarshal(req.Body, &j) != nil {
+		return false
 	}
 	if j["jsonrpc"] != "2.0" {
-		return nil, 0, "", nil, false
+		return false
 	}
 	method, _ := j["method"].(string)
 	if method == "" {
-		return nil, 0, "", nil, false
+		return false
 	}
 	idV, hasID := j["id"]
 	if !hasID {
-		return nil, 0, "", nil, false
+		return false
 	}
 	id, ok := idV.(float64)
 	if !ok {
-		return nil, 0, "", nil, false
+		return false
 	}
 	var args any
 	var toolName string
@@ -296,11 +284,11 @@ func (p *parser) tryBufferMCPPost(key connKey, req *http.Request) ([]byte, float
 		peer:      req.Host,
 		reqTime:   time.Now(),
 	}
-	return body, id, method, args, true
+	return true
 }
 
 // maybeEmitSSEFrames emits one AgentEvent per complete `data:` frame for MCP-paired streams.
-func (p *parser) maybeEmitSSEFrames(key connKey, req *http.Request) bool {
+func (p *parser) maybeEmitSSEFrames(key connKey, req *httpReq) bool {
 	headerEnd := bytes.Index(p.readBuf[key], []byte("\r\n\r\n"))
 	if headerEnd < 0 {
 		return false
@@ -338,7 +326,7 @@ func (p *parser) maybeEmitSSEFrames(key connKey, req *http.Request) bool {
 	return true
 }
 
-func (p *parser) emitSSEFrame(key connKey, req *http.Request, frame []byte) {
+func (p *parser) emitSSEFrame(key connKey, req *httpReq, frame []byte) {
 	if p.emit == nil {
 		return
 	}
@@ -389,7 +377,7 @@ func (p *parser) buildMCPPairedEvent(key connKey, pending *pendingMCPPost, resOb
 		reqBodyMap["params"] = params
 	}
 	reqJSON, _ := json.Marshal(map[string]any{
-		"method": "POST", "path": pending.req.URL.Path, "body": reqBodyMap,
+		"method": "POST", "path": pending.req.Path, "body": reqBodyMap,
 	})
 	resJSON, _ := json.Marshal(map[string]any{
 		"status": 200, "body": resObj,
@@ -406,9 +394,9 @@ func (p *parser) buildMCPPairedEvent(key connKey, pending *pendingMCPPost, resOb
 	}
 }
 
-func (p *parser) buildMCPStandaloneEvent(key connKey, req *http.Request, resObj map[string]any) *AgentEvent {
+func (p *parser) buildMCPStandaloneEvent(key connKey, req *httpReq, resObj map[string]any) *AgentEvent {
 	reqJSON, _ := json.Marshal(map[string]any{
-		"method": req.Method, "path": req.URL.Path, "body": nil,
+		"method": req.Method, "path": req.Path, "body": nil,
 	})
 	resJSON, _ := json.Marshal(map[string]any{
 		"status": 200, "body": resObj,
@@ -563,15 +551,15 @@ func responseComplete(b []byte) bool {
 	return true
 }
 
-func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) *AgentEvent {
+func (p *parser) buildEvent(key connKey, req *httpReq, res *httpRes) *AgentEvent {
 	latency := time.Since(p.reqTime[key]).Seconds() * 1000
-	reqBody := decodeBody(readAll(req.Body), req.Header.Get("Content-Encoding"))
-	resBody := decodeBody(readAll(res.Body), res.Header.Get("Content-Encoding"))
+	reqBody := decodeBody(req.Body, req.ContentEncoding)
+	resBody := decodeBody(res.Body, res.ContentEncoding)
 
 	reqMap, reqEmbed := parseBody(reqBody)
 	var resMap map[string]any
 	var resEmbed any
-	if isSSEContentType(res.Header.Get("Content-Type")) {
+	if isSSEContentType(res.ContentType) {
 		// SSE: must merge per-frame deltas into a single shape — can't pass through raw.
 		resEmbed = decodeSSEBody(resBody)
 		resMap, _ = resEmbed.(map[string]any)
@@ -581,7 +569,7 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 
 	reqJSON, _ := json.Marshal(map[string]any{
 		"method": req.Method,
-		"path":   req.URL.Path,
+		"path":   req.Path,
 		"body":   reqEmbed,
 	})
 	resJSON, _ := json.Marshal(map[string]any{
@@ -594,7 +582,7 @@ func (p *parser) buildEvent(key connKey, req *http.Request, res *http.Response) 
 		PID:         key.PID,
 		Timestamp:   float64(time.Now().UnixMilli()) / 1000,
 		Direction:   "send",
-		CommType:    classifyComm(req.Host, req.Method, req.URL.Path, reqMap, resMap, resBody, p.configPeers, p.llmEndpoints, p.mcpEndpoints),
+		CommType:    classifyComm(req.Host, req.Method, req.Path, reqMap, resMap, resBody, p.configPeers, p.llmEndpoints, p.mcpEndpoints),
 		ContentType: classifyContent(reqMap),
 		Peer:        req.Host,
 		Request:     reqJSON,
