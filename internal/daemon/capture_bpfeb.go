@@ -19,6 +19,11 @@ type CaptureExArg struct {
 	Ssl     uint64
 }
 
+type CaptureGoReadArg struct {
+	Buf  uint64
+	Conn uint64
+}
+
 type CaptureTcpRecvArg struct {
 	Sk     uint64
 	Buf    uint64
@@ -77,6 +82,9 @@ type CaptureProgramSpecs struct {
 	KprobeTcpRecvmsgEntry *ebpf.ProgramSpec `ebpf:"kprobe_tcp_recvmsg_entry"`
 	KprobeTcpRecvmsgRet   *ebpf.ProgramSpec `ebpf:"kprobe_tcp_recvmsg_ret"`
 	KprobeTcpSendmsg      *ebpf.ProgramSpec `ebpf:"kprobe_tcp_sendmsg"`
+	UprobeGoTlsReadEntry  *ebpf.ProgramSpec `ebpf:"uprobe_go_tls_read_entry"`
+	UprobeGoTlsReadRet    *ebpf.ProgramSpec `ebpf:"uprobe_go_tls_read_ret"`
+	UprobeGoTlsWrite      *ebpf.ProgramSpec `ebpf:"uprobe_go_tls_write"`
 	UprobeSslReadEntry    *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry"`
 	UprobeSslReadExEntry  *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_ex_entry"`
 	UprobeSslReadExRet    *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_ex_ret"`
@@ -95,6 +103,7 @@ type CaptureMapSpecs struct {
 	CandidateEmitted *ebpf.MapSpec `ebpf:"candidate_emitted"`
 	Events           *ebpf.MapSpec `ebpf:"events"`
 	ExArgs           *ebpf.MapSpec `ebpf:"ex_args"`
+	GoReadArgs       *ebpf.MapSpec `ebpf:"go_read_args"`
 	TcpFlows         *ebpf.MapSpec `ebpf:"tcp_flows"`
 	TcpRecvArgs      *ebpf.MapSpec `ebpf:"tcp_recv_args"`
 	WriteArgs        *ebpf.MapSpec `ebpf:"write_args"`
@@ -123,6 +132,7 @@ type CaptureMaps struct {
 	CandidateEmitted *ebpf.Map `ebpf:"candidate_emitted"`
 	Events           *ebpf.Map `ebpf:"events"`
 	ExArgs           *ebpf.Map `ebpf:"ex_args"`
+	GoReadArgs       *ebpf.Map `ebpf:"go_read_args"`
 	TcpFlows         *ebpf.Map `ebpf:"tcp_flows"`
 	TcpRecvArgs      *ebpf.Map `ebpf:"tcp_recv_args"`
 	WriteArgs        *ebpf.Map `ebpf:"write_args"`
@@ -134,6 +144,7 @@ func (m *CaptureMaps) Close() error {
 		m.CandidateEmitted,
 		m.Events,
 		m.ExArgs,
+		m.GoReadArgs,
 		m.TcpFlows,
 		m.TcpRecvArgs,
 		m.WriteArgs,
@@ -147,6 +158,9 @@ type CapturePrograms struct {
 	KprobeTcpRecvmsgEntry *ebpf.Program `ebpf:"kprobe_tcp_recvmsg_entry"`
 	KprobeTcpRecvmsgRet   *ebpf.Program `ebpf:"kprobe_tcp_recvmsg_ret"`
 	KprobeTcpSendmsg      *ebpf.Program `ebpf:"kprobe_tcp_sendmsg"`
+	UprobeGoTlsReadEntry  *ebpf.Program `ebpf:"uprobe_go_tls_read_entry"`
+	UprobeGoTlsReadRet    *ebpf.Program `ebpf:"uprobe_go_tls_read_ret"`
+	UprobeGoTlsWrite      *ebpf.Program `ebpf:"uprobe_go_tls_write"`
 	UprobeSslReadEntry    *ebpf.Program `ebpf:"uprobe_ssl_read_entry"`
 	UprobeSslReadExEntry  *ebpf.Program `ebpf:"uprobe_ssl_read_ex_entry"`
 	UprobeSslReadExRet    *ebpf.Program `ebpf:"uprobe_ssl_read_ex_ret"`
@@ -162,6 +176,9 @@ func (p *CapturePrograms) Close() error {
 		p.KprobeTcpRecvmsgEntry,
 		p.KprobeTcpRecvmsgRet,
 		p.KprobeTcpSendmsg,
+		p.UprobeGoTlsReadEntry,
+		p.UprobeGoTlsReadRet,
+		p.UprobeGoTlsWrite,
 		p.UprobeSslReadEntry,
 		p.UprobeSslReadExEntry,
 		p.UprobeSslReadExRet,

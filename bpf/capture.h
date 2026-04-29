@@ -8,7 +8,8 @@
 enum capture_dir { DIR_WRITE = 0, DIR_READ = 1 };
 
 // CANDIDATE = lightweight observe path for non-tracked PIDs (carries dst + first-bytes for SNI/Host parse).
-enum capture_source { SOURCE_TLS = 0, SOURCE_PLAIN = 1, SOURCE_CANDIDATE = 2 };
+// GO_TLS = userspace plaintext from Go's crypto/tls.(*Conn).Read/Write uprobes (Go register ABI, not C).
+enum capture_source { SOURCE_TLS = 0, SOURCE_PLAIN = 1, SOURCE_CANDIDATE = 2, SOURCE_GO_TLS = 3 };
 
 struct capture_event {
     __u32 pid;

@@ -235,8 +235,11 @@ func (p *parser) feed(raw RawEvent) *AgentEvent {
 	return nil
 }
 
-// tryBufferMCPPost stashes MCP JSON-RPC POST /messages/ requests by jsonrpc id for SSE pairing later.
-// Returns true if the request was buffered (caller drops normal flow for this event).
+// tryBufferMCPPost intercepts MCP JSON-RPC POST /messages/ traffic. Returns
+// true when the message is MCP (caller drops normal flow). Three sub-cases:
+//   - method + id: client request — buffered for later SSE pairing
+//   - method, no id: client notification — emitted directly (no response expected)
+//   - anything else: not MCP, return false to fall through to normal flow
 func (p *parser) tryBufferMCPPost(key connKey, req *httpReq) bool {
 	if req.Method != "POST" {
 		return false
@@ -257,7 +260,12 @@ func (p *parser) tryBufferMCPPost(key connKey, req *httpReq) bool {
 	}
 	idV, hasID := j["id"]
 	if !hasID {
-		return false
+		// Client → server notification (no id). Emit standalone event,
+		// never expect a paired SSE response.
+		if p.emit != nil {
+			p.emit(p.buildMCPNotificationEvent(key, req, j, "client"))
+		}
+		return true
 	}
 	id, ok := idV.(float64)
 	if !ok {
@@ -346,16 +354,33 @@ func (p *parser) emitSSEFrame(key connKey, req *httpReq, frame []byte) {
 		return
 	}
 
-	if j["jsonrpc"] == "2.0" {
-		if id, ok := j["id"].(float64); ok {
-			if pending, ok := p.mcpPending[key.PID][id]; ok {
-				p.emit(p.buildMCPPairedEvent(key, pending, j))
-				delete(p.mcpPending[key.PID], id)
-				return
-			}
-			p.emit(p.buildMCPStandaloneEvent(key, req, j))
+	if j["jsonrpc"] != "2.0" {
+		return
+	}
+	method, hasMethod := j["method"].(string)
+	hasMethod = hasMethod && method != ""
+	idVal, hasID := j["id"]
+	id, idIsFloat := idVal.(float64)
+
+	switch {
+	case hasMethod && hasID && idIsFloat:
+		// Server → client request (e.g. sampling/createMessage). The client
+		// will reply via a subsequent POST. We surface it as its own event
+		// and don't try to pair — the reply belongs to the client side.
+		p.emit(p.buildMCPServerRequestEvent(key, req, j))
+
+	case hasMethod && !hasID:
+		// Server → client notification (notifications/progress, etc.).
+		p.emit(p.buildMCPNotificationEvent(key, req, j, "server"))
+
+	case !hasMethod && hasID && idIsFloat:
+		// Server → client response. Pair with our pending request if any.
+		if pending, ok := p.mcpPending[key.PID][id]; ok {
+			p.emit(p.buildMCPPairedEvent(key, pending, j))
+			delete(p.mcpPending[key.PID], id)
 			return
 		}
+		p.emit(p.buildMCPStandaloneEvent(key, req, j))
 	}
 }
 
@@ -410,6 +435,66 @@ func (p *parser) buildMCPStandaloneEvent(key connKey, req *httpReq, resObj map[s
 		Request:   reqJSON,
 		Response:  resJSON,
 		LatencyMs: 0,
+	}
+}
+
+// buildMCPNotificationEvent emits a JSON-RPC notification (no id, no expected
+// reply). origin is "client" or "server" depending on which side sent it.
+func (p *parser) buildMCPNotificationEvent(key connKey, req *httpReq, frame map[string]any, origin string) *AgentEvent {
+	registerEndpoint(p.mcpEndpoints, req.Host, maxMCPEndpoints, "MCP")
+	body := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  frame["method"],
+	}
+	if params, ok := frame["params"]; ok {
+		body["params"] = params
+	}
+	reqJSON, _ := json.Marshal(map[string]any{
+		"method": "NOTIFICATION/" + origin,
+		"path":   req.Path,
+		"body":   body,
+	})
+	resJSON, _ := json.Marshal(map[string]any{"status": 0, "body": nil})
+	return &AgentEvent{
+		Host:      key.Host, PID: key.PID,
+		Timestamp: float64(time.Now().UnixMilli()) / 1000,
+		Direction: "send",
+		CommType:  "Agent↔MCP",
+		Peer:      req.Host,
+		Request:   reqJSON,
+		Response:  resJSON,
+	}
+}
+
+// buildMCPServerRequestEvent emits a server-initiated JSON-RPC request
+// (e.g. sampling/createMessage). The client's response will arrive on the
+// next POST and surfaces as a separate event — we don't try to pair them.
+func (p *parser) buildMCPServerRequestEvent(key connKey, req *httpReq, frame map[string]any) *AgentEvent {
+	registerEndpoint(p.mcpEndpoints, req.Host, maxMCPEndpoints, "MCP")
+	body := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  frame["method"],
+	}
+	if id, ok := frame["id"]; ok {
+		body["id"] = id
+	}
+	if params, ok := frame["params"]; ok {
+		body["params"] = params
+	}
+	reqJSON, _ := json.Marshal(map[string]any{
+		"method": "SERVER-REQUEST",
+		"path":   req.Path,
+		"body":   body,
+	})
+	resJSON, _ := json.Marshal(map[string]any{"status": 0, "body": nil})
+	return &AgentEvent{
+		Host:      key.Host, PID: key.PID,
+		Timestamp: float64(time.Now().UnixMilli()) / 1000,
+		Direction: "send",
+		CommType:  "Agent↔MCP",
+		Peer:      req.Host,
+		Request:   reqJSON,
+		Response:  resJSON,
 	}
 }
 

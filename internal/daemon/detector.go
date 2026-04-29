@@ -153,6 +153,11 @@ type detector struct {
 	confirmWindow    time.Duration
 	confirmMaxEvents int
 
+	// onPromote, if set, is invoked on the promote goroutine right after a
+	// PID enters agent_pids. Currently used to dynamically attach Go TLS
+	// uprobes to the PID's binary (see goTLSAttacher.attachByPID).
+	onPromote func(pid uint32)
+
 	mu         sync.Mutex
 	pending    map[uint32]time.Time
 	confirming map[uint32]*confirmState
@@ -252,6 +257,11 @@ func (d *detector) handle(ev RawEvent) {
 	d.mu.Unlock()
 	log.Printf("detector: provisional promote pid=%d (%s=%s, dst=%s) — awaiting agent signal",
 		ev.PID, reason, hostShown, formatDst(ev.DstIP, ev.DstPort))
+	if d.onPromote != nil {
+		// Run async: attaching uprobes does I/O and we don't want to block the
+		// ringbuf reader (this code path is invoked synchronously from there).
+		go d.onPromote(ev.PID)
+	}
 }
 
 // observeEvent: while a PID is confirming, look for an agent signal in each AgentEvent.
@@ -314,11 +324,26 @@ func (d *detector) demote(pid uint32, reason string) {
 		pid, reason)
 }
 
+// hasAgentSignal returns true only when we have proof of a completed
+// agent round-trip (LLM decision + tool use + agent control flow).
+//
+// Strong single-message proofs:
+//   - Agent↔MCP / Agent↔Agent: protocol itself implies agent.
+//   - `"role":"tool"` / `"role":"function"` in the request: the caller is
+//     submitting a tool-execution result back to the LLM. This is only sent
+//     by code that (a) defined tools, (b) received tool_calls from the LLM,
+//     (c) actually ran the tool, (d) packed the result and continued the
+//     conversation — i.e. the full agent loop has executed at least once.
+//
+// Weaker single-message signals (`"tools":`, `"tool_calls":` etc.) are
+// intentionally NOT confirm signals on their own — they can come from a
+// `curl --data` test or a model response the caller never acted on. We'd
+// rather demote those after the confirm window than over-claim.
 func hasAgentSignal(ev *AgentEvent) bool {
 	if ev.CommType == "Agent↔MCP" || ev.CommType == "Agent↔Agent" {
 		return true
 	}
-	return hasToolKeyword(ev.Request) || hasToolKeyword(ev.Response)
+	return hasToolResultMessage(ev.Request)
 }
 
 func classifySignal(ev *AgentEvent) string {
@@ -328,23 +353,21 @@ func classifySignal(ev *AgentEvent) string {
 	case "Agent↔Agent":
 		return "A2A traffic"
 	}
-	if hasToolKeyword(ev.Request) {
-		return "tools/functions in request body"
-	}
-	return "tool_calls/tool_use in response body"
+	return "tool round-trip (role:tool/function in request body)"
 }
 
-// hasToolKeyword: JSON keys are quoted, so a literal substring match suffices.
-func hasToolKeyword(b []byte) bool {
+// hasToolResultMessage looks for a tool-result message inside the request
+// body's `messages` array. OpenAI uses `"role":"tool"`, legacy/Anthropic
+// usage uses `"role":"function"`. Both are reserved role names — they don't
+// appear in non-agent JSON traffic in practice.
+func hasToolResultMessage(b []byte) bool {
 	if len(b) == 0 {
 		return false
 	}
-	for _, k := range [][]byte{[]byte(`"tools":`), []byte(`"functions":`), []byte(`"tool_calls":`), []byte(`"tool_use"`)} {
-		if bytes.Contains(b, k) {
-			return true
-		}
-	}
-	return false
+	return bytes.Contains(b, []byte(`"role":"tool"`)) ||
+		bytes.Contains(b, []byte(`"role": "tool"`)) ||
+		bytes.Contains(b, []byte(`"role":"function"`)) ||
+		bytes.Contains(b, []byte(`"role": "function"`))
 }
 
 func (d *detector) runJanitor(stop <-chan struct{}) {

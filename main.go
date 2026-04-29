@@ -21,6 +21,7 @@ func main() {
 	host := flag.String("host", "", "hostname override (daemon mode)")
 	cmdlineFilter := flag.String("cmdline-filter", "", "only promote PIDs whose cmdline contains this substring")
 	configPath := flag.String("config", "./agentscope.yaml", "YAML config path (optional)")
+	symbolMap := flag.String("symbol-map", "", "JSON sidecar of {buildID: {SSL_read: offset, ...}} for stripped static-libssl/BoringSSL binaries (daemon mode)")
 	var peerPairs []string
 	flag.Var(daemon.NewPeerListFlag(&peerPairs), "peer", "peer comm-type override, e.g. -peer '10.0.0.2:8080=Agent↔Agent' (repeatable)")
 	flag.Parse()
@@ -41,7 +42,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("config: %v", err)
 		}
-		daemon.Run(*masterAddr, *host, *cmdlineFilter, overrides, rules, sig)
+		sidecar, err := daemon.LoadStaticOpenSSLSymbolMap(*symbolMap)
+		if err != nil {
+			log.Fatalf("symbol-map: %v", err)
+		}
+		daemon.Run(*masterAddr, *host, *cmdlineFilter, overrides, rules, sidecar, sig)
 	case "master":
 		master.Run(*listen, *verbose, sig)
 	default:

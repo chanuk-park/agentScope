@@ -4,7 +4,6 @@ package daemon
 
 import (
 	"encoding/binary"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -29,22 +28,16 @@ type RawEvent struct {
 
 const sourceCandidate uint8 = 2
 
-func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]string, rules *DetectorRules, stop chan os.Signal) {
+func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]string, rules *DetectorRules, sidecar *staticOpenSSLSymbolMap, stop chan os.Signal) {
 	objs := CaptureObjects{}
 	if err := LoadCaptureObjects(&objs, nil); err != nil {
 		log.Fatalf("load bpf: %v", err)
 	}
 	defer objs.Close()
 
-	sslPath, err := findLibSSL()
-	if err != nil {
-		log.Fatalf("libssl not found: %v", err)
-	}
-	log.Printf("attaching to %s", sslPath)
-
-	ex, err := link.OpenExecutable(sslPath)
-	if err != nil {
-		log.Fatalf("open executable: %v", err)
+	sslPaths := findTLSLibs()
+	if len(sslPaths) == 0 {
+		log.Fatalf("no libssl found in standard paths")
 	}
 
 	attach := []struct {
@@ -63,17 +56,40 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 	}
 
 	var links []link.Link
-	for _, a := range attach {
-		var l link.Link
-		if a.ret {
-			l, err = ex.Uretprobe(a.sym, a.prog, nil)
-		} else {
-			l, err = ex.Uprobe(a.sym, a.prog, nil)
-		}
+	totalAttached := 0
+	for _, sslPath := range sslPaths {
+		ex, err := link.OpenExecutable(sslPath)
 		if err != nil {
-			log.Fatalf("attach %s: %v", a.sym, err)
+			log.Printf("skip %s: open: %v", sslPath, err)
+			continue
 		}
-		links = append(links, l)
+		libAttached := 0
+		for _, a := range attach {
+			var l link.Link
+			if a.ret {
+				l, err = ex.Uretprobe(a.sym, a.prog, nil)
+			} else {
+				l, err = ex.Uprobe(a.sym, a.prog, nil)
+			}
+			if err != nil {
+				// Older OpenSSL/BoringSSL drops *_ex variants — soft-fail.
+				log.Printf("skip %s:%s: %v", sslPath, a.sym, err)
+				continue
+			}
+			links = append(links, l)
+			libAttached++
+		}
+		log.Printf("attached %d/%d uprobes on %s", libAttached, len(attach), sslPath)
+		totalAttached += libAttached
+	}
+	if totalAttached == 0 {
+		log.Fatalf("failed to attach any uprobe across %d libssl candidates", len(sslPaths))
+	}
+
+	goAttacher := newGoTLSAttacher(&objs, sidecar)
+	defer goAttacher.close()
+	if n := goAttacher.initialScan(cmdlineFilter); n > 0 {
+		log.Printf("Go TLS: %d uprobe(s) attached on startup scan", n)
 	}
 
 	kprobes := []struct {
@@ -86,7 +102,10 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 		{"tcp_recvmsg", objs.KprobeTcpRecvmsgRet, true},
 	}
 	for _, k := range kprobes {
-		var l link.Link
+		var (
+			l   link.Link
+			err error
+		)
 		if k.ret {
 			l, err = link.Kretprobe(k.sym, k.prog, nil)
 		} else {
@@ -120,6 +139,7 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 	go sender.run()
 
 	det := newDetector(rules, objs.AgentPids, parser, cmdlineFilter, 5*time.Minute)
+	det.onPromote = goAttacher.attachByPID
 	forward := func(ev *AgentEvent) {
 		det.observeEvent(ev)
 		sender.enqueue(ev)
@@ -127,6 +147,8 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 	parser.emit = forward
 	detStop := make(chan struct{})
 	go det.runJanitor(detStop)
+	gcStop := make(chan struct{})
+	go goAttacher.runGC(30*time.Second, gcStop)
 	if cmdlineFilter != "" {
 		log.Printf("detector active (cmdline scope: %q, %d hostnames + %d patterns + %d http paths)",
 			cmdlineFilter, len(rules.Hostnames), len(rules.HostnamePatterns), len(rules.HTTPPaths))
@@ -135,7 +157,7 @@ func Run(masterAddr, hostOverride, cmdlineFilter string, configPeers map[string]
 			len(rules.Hostnames), len(rules.HostnamePatterns), len(rules.HTTPPaths))
 	}
 
-	go func() { <-stop; close(detStop); rd.Close() }()
+	go func() { <-stop; close(detStop); close(gcStop); rd.Close() }()
 
 	log.Println("capturing... (Ctrl+C to stop)")
 	for {
@@ -223,16 +245,39 @@ func tailForLog(b []byte) []byte {
 	return b
 }
 
-func findLibSSL() (string, error) {
+// findTLSLibs returns the union of OpenSSL-ABI libraries present on the host
+// (glibc OpenSSL, musl OpenSSL on Alpine, BoringSSL drop-ins). Symlinked
+// duplicates are collapsed by canonical path. Caller attaches uprobes per
+// returned path; per-path attach failures should be soft errors.
+func findTLSLibs() []string {
 	patterns := []string{
+		// glibc OpenSSL (Debian/Ubuntu/Fedora/RHEL family)
 		"/usr/lib/x86_64-linux-gnu/libssl.so.*",
-		"/usr/lib/libssl.so.*",
+		"/usr/lib64/libssl.so.*",
 		"/lib/x86_64-linux-gnu/libssl.so.*",
+		"/usr/lib/libssl.so.*",
+		// musl OpenSSL (Alpine ships libssl in /lib or /usr/lib)
+		"/lib/libssl.so.*",
+		// out-of-tree installs (BoringSSL drop-in, custom builds)
+		"/usr/local/lib/libssl.so.*",
+		"/usr/local/lib64/libssl.so.*",
+		"/opt/*/lib/libssl.so.*",
 	}
+	seen := map[string]bool{}
+	var out []string
 	for _, p := range patterns {
-		if m, _ := filepath.Glob(p); len(m) > 0 {
-			return m[0], nil
+		matches, _ := filepath.Glob(p)
+		for _, m := range matches {
+			real, err := filepath.EvalSymlinks(m)
+			if err != nil {
+				real = m
+			}
+			if seen[real] {
+				continue
+			}
+			seen[real] = true
+			out = append(out, m)
 		}
 	}
-	return "", fmt.Errorf("libssl.so not found")
+	return out
 }

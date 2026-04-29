@@ -24,6 +24,16 @@ struct {
     __type(value, struct ex_arg);
 } ex_args SEC(".maps");
 
+// Go's crypto/tls.(*Conn).Read fills the buffer; we must capture at ret with the
+// actual byte count. Save (buf, conn) at entry, look up at ret.
+struct go_read_arg { __u64 buf; __u64 conn; };
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, u64);
+    __type(value, struct go_read_arg);
+} go_read_args SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
@@ -188,6 +198,40 @@ int uprobe_ssl_read_ex_ret(struct pt_regs *ctx) {
     bpf_probe_read_user(&readbytes, sizeof(readbytes), (void *)arg->written);
     if (readbytes > 0) push_event(DIR_READ, SOURCE_TLS, arg->buf, (u32)readbytes, arg->ssl);
     bpf_map_delete_elem(&ex_args, &id);
+    return 0;
+}
+
+// ---------------- Go crypto/tls (register ABI: AX=recv, BX=slice.ptr, CX=slice.len) ----------------
+// (*tls.Conn).Write(p []byte) — full plaintext is in p at entry, capture there.
+SEC("uprobe/go_tls_write")
+int uprobe_go_tls_write(struct pt_regs *ctx) {
+    if (!is_agent()) return 0;
+    u64 conn = ctx->ax;
+    u64 buf  = ctx->bx;
+    long len = (long)ctx->cx;
+    if (len <= 0) return 0;
+    push_event(DIR_WRITE, SOURCE_GO_TLS, buf, (u32)len, conn);
+    return 0;
+}
+
+// (*tls.Conn).Read(p []byte) — buffer filled by callee, capture at ret with n=AX.
+SEC("uprobe/go_tls_read")
+int uprobe_go_tls_read_entry(struct pt_regs *ctx) {
+    if (!is_agent()) return 0;
+    u64 id = bpf_get_current_pid_tgid();
+    struct go_read_arg arg = { .buf = ctx->bx, .conn = ctx->ax };
+    bpf_map_update_elem(&go_read_args, &id, &arg, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/go_tls_read")
+int uprobe_go_tls_read_ret(struct pt_regs *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+    struct go_read_arg *arg = bpf_map_lookup_elem(&go_read_args, &id);
+    if (!arg) return 0;
+    long n = (long)ctx->ax;
+    if (n > 0) push_event(DIR_READ, SOURCE_GO_TLS, arg->buf, (u32)n, arg->conn);
+    bpf_map_delete_elem(&go_read_args, &id);
     return 0;
 }
 
